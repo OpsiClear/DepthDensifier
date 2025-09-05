@@ -527,15 +527,30 @@ class DepthRefiner:
         :param Dy_neg: Negative y-direction gradient operator
         :return: tuple of (wx, wy) edge weights for x and y directions
         """
+        # Replace any NaN or inf values in z with 0
+        z_clean = cp.where(cp.isfinite(z), z, 0)
+        
         # Compute gradients
-        grad_x_pos = Dx_pos.dot(z)
-        grad_x_neg = Dx_neg.dot(z)
-        grad_y_pos = Dy_pos.dot(z)
-        grad_y_neg = Dy_neg.dot(z)
+        grad_x_pos = Dx_pos.dot(z_clean)
+        grad_x_neg = Dx_neg.dot(z_clean)
+        grad_y_pos = Dy_pos.dot(z_clean)
+        grad_y_neg = Dy_neg.dot(z_clean)
 
+        # Compute differences safely
+        diff_x = grad_x_neg**2 - grad_x_pos**2
+        diff_y = grad_y_neg**2 - grad_y_pos**2
+        
+        # Replace NaN/inf with 0 before sigmoid
+        diff_x = cp.where(cp.isfinite(diff_x), diff_x, 0)
+        diff_y = cp.where(cp.isfinite(diff_y), diff_y, 0)
+        
         # Compute weights using sigmoid
-        wx = self.sigmoid(grad_x_neg**2 - grad_x_pos**2, self.k_sigmoid)
-        wy = self.sigmoid(grad_y_neg**2 - grad_y_pos**2, self.k_sigmoid)
+        wx = self.sigmoid(diff_x, self.k_sigmoid)
+        wy = self.sigmoid(diff_y, self.k_sigmoid)
+        
+        # Ensure weights are valid (between 0 and 1)
+        wx = cp.clip(wx, 0.0, 1.0)
+        wy = cp.clip(wy, 0.0, 1.0)
 
         return wx, wy
 
@@ -664,10 +679,18 @@ class DepthRefiner:
 
         # Move to GPU if available
         depth_map_gpu = cp.asarray(depth_map * scale, dtype=np.float64)
+        
+        # Clean up any NaN or inf values
+        depth_map_gpu = cp.where(cp.isfinite(depth_map_gpu), depth_map_gpu, 1.0)
+        depth_map_gpu = cp.maximum(depth_map_gpu, 1e-6)  # Ensure positive
 
         # Initialize in log space
         z = cp.log(depth_map_gpu + 1e-6).flatten()
         z_prior = z.copy()
+        
+        # Clean up any remaining NaN/inf
+        z = cp.where(cp.isfinite(z), z, 0.0)
+        z_prior = cp.where(cp.isfinite(z_prior), z_prior, 0.0)
 
         # Process normals if provided
         if use_normals:
@@ -797,7 +820,11 @@ class DepthRefiner:
                 b[sparse_ids] += self.lambda2 * sparse_precision * sparse_depth
 
             # Solve using conjugate gradient
-            z_new, info = cg(A, b, x0=z, maxiter=self.cg_max_iter, tol=self.cg_tol)
+            if device == "cuda":
+                z_new, info = cg(A, b, x0=z, maxiter=self.cg_max_iter, tol=self.cg_tol)
+            else:
+                # scipy uses rtol instead of tol
+                z_new, info = cg(A, b, x0=z, maxiter=self.cg_max_iter, rtol=self.cg_tol)
 
             # Compute energy
             energy = float(cp.sum((z_new - z_prior) ** 2))
