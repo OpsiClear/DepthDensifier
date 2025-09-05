@@ -205,7 +205,7 @@ class DepthRefiner:
         # Dx positive (right difference)
         idx_right = cp.zeros((h, w), dtype=int)
         idx_right[:, :-1] = idx[:, 1:]
-        data = cp.ones(has_right_flat.sum())
+        data = cp.ones(has_right_flat.sum().item())
         indices = cp.concatenate(
             [idx[has_right].flatten(), idx_right[has_right].flatten()]
         )
@@ -219,7 +219,7 @@ class DepthRefiner:
         # Dx negative (left difference)
         idx_left = cp.zeros((h, w), dtype=int)
         idx_left[:, 1:] = idx[:, :-1]
-        data = cp.ones(has_left_flat.sum())
+        data = cp.ones(has_left_flat.sum().item())
         indices = cp.concatenate(
             [idx_left[has_left].flatten(), idx[has_left].flatten()]
         )
@@ -233,7 +233,7 @@ class DepthRefiner:
         # Dy positive (bottom difference)
         idx_bottom = cp.zeros((h, w), dtype=int)
         idx_bottom[:-1, :] = idx[1:, :]
-        data = cp.ones(has_bottom_flat.sum())
+        data = cp.ones(has_bottom_flat.sum().item())
         indices = cp.concatenate(
             [idx[has_bottom].flatten(), idx_bottom[has_bottom].flatten()]
         )
@@ -247,7 +247,7 @@ class DepthRefiner:
         # Dy negative (top difference)
         idx_top = cp.zeros((h, w), dtype=int)
         idx_top[1:, :] = idx[:-1, :]
-        data = cp.ones(has_top_flat.sum())
+        data = cp.ones(has_top_flat.sum().item())
         indices = cp.concatenate([idx_top[has_top].flatten(), idx[has_top].flatten()])
         indptr = cp.concatenate(
             [cp.array([0]), cp.cumsum(has_top_flat.astype(int) * 2)]
@@ -444,7 +444,7 @@ class DepthRefiner:
             (h, w),
         )
         sparse_ids = cp.asarray(sparse_ids)
-        sparse_depth = cp.asarray(cp.log(depths3d + 1e-6))
+        sparse_depth = cp.log(cp.asarray(depths3d) + 1e-6)
         sparse_precision = cp.ones(len(sparse_ids))
 
         # Filter outliers based on scale consistency
