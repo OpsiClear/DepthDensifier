@@ -546,6 +546,7 @@ class DepthRefiner:
         points3D: np.ndarray,
         cam_from_world: np.ndarray,
         K: np.ndarray,
+        mask: np.ndarray | None = None,
         depth_uncertainty: np.ndarray | None = None,
         normal_uncertainty: np.ndarray | None = None,
     ) -> dict[str, Any]:
@@ -559,6 +560,7 @@ class DepthRefiner:
         :param points3D: Nx3 array of 3D points in world coordinates
         :param cam_from_world: 3x4 camera extrinsics matrix
         :param K: 3x3 camera intrinsics matrix
+        :param mask: HxW mask of valid pixels (optional)
         :param depth_uncertainty: HxW depth uncertainty map (optional)
         :param normal_uncertainty: HxWx3 normal uncertainty map (optional)
         :return: Dictionary with refined_depth (HxW refined depth map), scale (computed scale factor),
@@ -644,9 +646,12 @@ class DepthRefiner:
 
         # Sample depth at projected points
         depth_at_pts = self.sample_depth_at_points(depth_map, pts2d)
+        if mask is not None:
+            mask_at_pts = self.sample_depth_at_points(mask.astype(float), pts2d) > 0.5
 
-        # Compute robust scale using median
-        valid_scale = (depth_at_pts > 1e-3) & (depths3d > 1e-3)
+        # Combine all validity checks
+        valid_scale = (depth_at_pts > 1e-3) & (depths3d > 1e-3) & (mask_at_pts if mask is not None else True)
+
         if valid_scale.sum() == 0:
             print("Warning: No valid depth correspondences")
             scale = 1.0

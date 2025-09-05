@@ -9,6 +9,7 @@ import time
 
 # Import the refiner from your source directory
 from depthdensifier.refiner import DepthRefiner, cp, device as refiner_device
+from depthdensifier.initilizer import compute_image_gradients_gpu
 
 # ==============================================================================
 # 1. CONFIGURATION
@@ -27,7 +28,7 @@ MOGE_CHECKPOINT = "models/moge/moge-2-vitl-normal/model.pt"
 # --- Processing & Densification Parameters ---
 # Factor by which to downsample images before MoGe inference and refinement.
 # A larger factor is MUCH faster and uses less memory. (e.g., 4 or 8).
-PIPELINE_DOWNSAMPLE_FACTOR = 16
+PIPELINE_DOWNSAMPLE_FACTOR = 8
 
 # Controls the final density of the point cloud, relative to the processing resolution.
 # 1 = densest, 2 = half density, etc.
@@ -38,7 +39,40 @@ REFINER_CONFIG = {
     "lambda1": 1.0,
     "lambda2": 10.0,
     "verbose": 1,
+    "cg_max_iter": 50,
 }
+def generate_saliency_mask(
+    image_tensor: torch.Tensor,
+    gradient_threshold_percentile: float = 50.0,
+) -> np.ndarray:
+    """
+    Generates a binary saliency mask based on image gradients.
+    
+    Pixels with high gradients (edges, textures) are marked as salient (True).
+    
+    Args:
+        image_tensor: Input image tensor of shape [C, H, W] on GPU.
+        gradient_threshold_percentile: The percentile of gradient magnitude to use as a threshold.
+                                       Higher values result in a sparser, more selective mask.
+                                       A value of 70 means only the top 30% of gradients are kept.
+                                       
+    Returns:
+        A boolean numpy array (mask) of shape [H, W].
+    """
+    with torch.no_grad():
+        # Compute gradients on the GPU
+        gradient_map = compute_image_gradients_gpu(image_tensor)
+        
+        # Determine the threshold value based on the specified percentile
+        if gradient_map.numel() > 0:
+            threshold = torch.quantile(gradient_map.view(-1), gradient_threshold_percentile / 100.0)
+        else:
+            threshold = 0
+        
+        # Create a binary mask where gradients are above the threshold
+        saliency_mask = (gradient_map > threshold)
+        
+    return saliency_mask.cpu().numpy()
 
 def unproject_points(points2D, depth, camera: pycolmap.Camera):
     """Unprojects 2D image points to 3D camera coordinates."""
@@ -106,6 +140,7 @@ def main():
     all_dense_points = []
     num_points = 0
     image_list = [img for img in rec.images.values() if img.has_pose]
+    image_list = image_list[:2]
     for image in tqdm(image_list, desc="Refining and Densifying"):
         per_image_start_time = time.time()
         
@@ -145,11 +180,15 @@ def main():
         moge_normal = moge_output['normal'].squeeze(0).cpu().numpy()
         moge_mask = moge_output['mask'].squeeze(0).cpu().numpy()
 
+        saliency_mask = generate_saliency_mask(
+            image_tensor=img_tensor.squeeze(0), # Pass the [C, H, W] tensor
+        )
+
         # --- Refine the depth map at the processing resolution ---
         step_start_time = time.time()
         camera = rec.cameras[image.camera_id]
         camera.rescale(new_width=new_w, new_height=new_h)
-        
+        rec.cameras[image.camera_id] = camera
         if REFINER_CONFIG['verbose'] > 0:
             print(f"\n--- Refining depth for {image.name} (ID: {image.image_id}) ---")
 
@@ -158,8 +197,12 @@ def main():
             normal_map=moge_normal,
             points3D=points3D_world,
             cam_from_world=image.cam_from_world().matrix(),
-            K=camera.calibration_matrix()
+            K=camera.calibration_matrix(),
+            mask=moge_mask,
         )
+        if refinement_results['num_iterations'] == 50:
+            print(f"  - Depth Refinement: {time.time() - step_start_time:.2f}s")
+            continue
         if REFINER_CONFIG['verbose'] > 0:
             print(f"  - Depth Refinement: {time.time() - step_start_time:.2f}s")
         
@@ -169,7 +212,7 @@ def main():
         step_start_time = time.time()
         h, w = refined_depth.shape
         pixels_y, pixels_x = np.mgrid[0:h:DOWNSAMPLE_DENSITY, 0:w:DOWNSAMPLE_DENSITY]
-        valid_pixels = moge_mask[pixels_y, pixels_x].astype(bool)
+        valid_pixels = moge_mask[pixels_y, pixels_x].astype(bool) & saliency_mask[pixels_y, pixels_x]
         
         pixels_x, pixels_y = pixels_x[valid_pixels], pixels_y[valid_pixels]
         depth_values = refined_depth[pixels_y, pixels_x]
@@ -219,7 +262,7 @@ def main():
         print(f"Removing {rec.num_points3D()} old sparse points...")
         old_point3D_ids = list(rec.points3D.keys())
         for pid in old_point3D_ids:
-            rec.delete_point3D(pid)
+            rec.points3D[pid].color = np.array([255, 0, 0])
         print(f"-> Old points removed in {time.time() - step_start_time:.2f}s.")
 
         step_start_time = time.time()
