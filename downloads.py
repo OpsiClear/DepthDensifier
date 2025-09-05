@@ -66,6 +66,7 @@ class DownloadConfig:
     """Which MoGe models to download: 'all', 'recommended', 'v1', 'v2', or comma-separated model names"""
 
 
+
 def create_data_directory(data_dir: Path) -> None:
     """Create the data directory if it doesn't exist.
 
@@ -174,6 +175,7 @@ def download_moge_model(
             shutil.rmtree(model_path)
 
 
+
 def get_moge_models() -> list[MoGeModelConfig]:
     """Get the list of available MoGe models.
 
@@ -226,6 +228,8 @@ def get_moge_models() -> list[MoGeModelConfig]:
             "params": "35M",
         },
     ]
+
+
 
 
 def main(config: DownloadConfig) -> None:
@@ -284,6 +288,7 @@ def main(config: DownloadConfig) -> None:
             for model in selected_models:
                 download_moge_model(model, models_dir, config.skip_existing)
 
+
     # Create additional directories
     for dir_name in ["outputs", "temp"]:
         (data_dir / dir_name).mkdir(exist_ok=True)
@@ -293,7 +298,7 @@ def main(config: DownloadConfig) -> None:
     if config.download_moge_models:
         print(f"   Models: {models_dir}")
         print(
-            f"Tip: Load models: MoGeModel.from_pretrained('{models_dir}/moge/MODEL_NAME')"
+            f"   MoGe models: Load with MoGeModel.from_pretrained('{models_dir}/moge/MODEL_NAME')"
         )
 
 

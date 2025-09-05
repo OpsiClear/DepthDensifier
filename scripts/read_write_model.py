@@ -28,12 +28,14 @@
 # POSSIBILITY OF SUCH DAMAGE.
 
 
-import argparse
 import collections
 import os
 import struct
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
+import tyro
 
 CameraModel = collections.namedtuple(
     "CameraModel", ["model_id", "model_name", "num_params"]
@@ -75,7 +77,7 @@ CAMERA_MODEL_NAMES = dict(
 )
 
 
-def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
+def read_next_bytes(fid, num_bytes: int, format_char_sequence: str, endian_character: str = "<") -> tuple:
     """Read and unpack the next bytes from a binary file.
     :param fid:
     :param num_bytes: Sum of combination of {2, 4, 8}, e.g. 2, 6, 16, 30, etc.
@@ -87,7 +89,7 @@ def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
     return struct.unpack(endian_character + format_char_sequence, data)
 
 
-def write_next_bytes(fid, data, format_char_sequence, endian_character="<"):
+def write_next_bytes(fid, data, format_char_sequence: str, endian_character: str = "<") -> None:
     """pack and write to a binary file.
     :param fid:
     :param data: data to send, if multiple elements are sent at the same time,
@@ -103,7 +105,7 @@ def write_next_bytes(fid, data, format_char_sequence, endian_character="<"):
     fid.write(bytes)
 
 
-def read_cameras_text(path):
+def read_cameras_text(path: str | Path) -> dict[int, Camera]:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::WriteCamerasText(const std::string& path)
@@ -133,7 +135,7 @@ def read_cameras_text(path):
     return cameras
 
 
-def read_cameras_binary(path_to_model_file):
+def read_cameras_binary(path_to_model_file: str | Path) -> dict[int, Camera]:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::WriteCamerasBinary(const std::string& path)
@@ -168,7 +170,7 @@ def read_cameras_binary(path_to_model_file):
     return cameras
 
 
-def write_cameras_text(cameras, path):
+def write_cameras_text(cameras: dict[int, Camera], path: str | Path) -> None:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::WriteCamerasText(const std::string& path)
@@ -187,7 +189,7 @@ def write_cameras_text(cameras, path):
             fid.write(line + "\n")
 
 
-def write_cameras_binary(cameras, path_to_model_file):
+def write_cameras_binary(cameras: dict[int, Camera], path_to_model_file: str | Path) -> dict[int, Camera]:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::WriteCamerasBinary(const std::string& path)
@@ -204,7 +206,7 @@ def write_cameras_binary(cameras, path_to_model_file):
     return cameras
 
 
-def read_images_text(path):
+def read_images_text(path: str | Path) -> dict[int, Image]:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::ReadImagesText(const std::string& path)
@@ -244,7 +246,7 @@ def read_images_text(path):
     return images
 
 
-def read_images_binary(path_to_model_file):
+def read_images_binary(path_to_model_file: str | Path) -> dict[int, Image]:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::ReadImagesBinary(const std::string& path)
@@ -294,7 +296,7 @@ def read_images_binary(path_to_model_file):
     return images
 
 
-def write_images_text(images, path):
+def write_images_text(images: dict[int, Image], path: str | Path) -> None:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::ReadImagesText(const std::string& path)
@@ -334,7 +336,7 @@ def write_images_text(images, path):
             fid.write(" ".join(points_strings) + "\n")
 
 
-def write_images_binary(images, path_to_model_file):
+def write_images_binary(images: dict[int, Image], path_to_model_file: str | Path) -> None:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::ReadImagesBinary(const std::string& path)
@@ -355,7 +357,7 @@ def write_images_binary(images, path_to_model_file):
                 write_next_bytes(fid, [*xy, p3d_id], "ddq")
 
 
-def read_points3D_text(path):
+def read_points3D_text(path: str | Path) -> dict[int, Point3D]:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::ReadPoints3DText(const std::string& path)
@@ -387,7 +389,7 @@ def read_points3D_text(path):
     return points3D
 
 
-def read_points3D_binary(path_to_model_file):
+def read_points3D_binary(path_to_model_file: str | Path) -> dict[int, Point3D]:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::ReadPoints3DBinary(const std::string& path)
@@ -425,7 +427,7 @@ def read_points3D_binary(path_to_model_file):
     return points3D
 
 
-def write_points3D_text(points3D, path):
+def write_points3D_text(points3D: dict[int, Point3D], path: str | Path) -> None:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::ReadPoints3DText(const std::string& path)
@@ -456,7 +458,7 @@ def write_points3D_text(points3D, path):
             fid.write(" ".join(track_strings) + "\n")
 
 
-def write_points3D_binary(points3D, path_to_model_file):
+def write_points3D_binary(points3D: dict[int, Point3D], path_to_model_file: str | Path) -> None:
     """
     see: src/colmap/scene/reconstruction.cc
         void Reconstruction::ReadPoints3DBinary(const std::string& path)
@@ -475,7 +477,7 @@ def write_points3D_binary(points3D, path_to_model_file):
                 write_next_bytes(fid, [image_id, point2D_id], "ii")
 
 
-def detect_model_format(path, ext):
+def detect_model_format(path: str | Path, ext: str) -> bool:
     if (
         os.path.isfile(os.path.join(path, "cameras" + ext))
         and os.path.isfile(os.path.join(path, "images" + ext))
@@ -487,7 +489,7 @@ def detect_model_format(path, ext):
     return False
 
 
-def read_model(path, ext=""):
+def read_model(path: str | Path, ext: str = "") -> tuple[dict[int, Camera], dict[int, Image], dict[int, Point3D]] | None:
     # try to detect the extension automatically
     if ext == "":
         if detect_model_format(path, ".bin"):
@@ -509,7 +511,13 @@ def read_model(path, ext=""):
     return cameras, images, points3D
 
 
-def write_model(cameras, images, points3D, path, ext=".bin"):
+def write_model(
+    cameras: dict[int, Camera], 
+    images: dict[int, Image], 
+    points3D: dict[int, Point3D], 
+    path: str | Path, 
+    ext: str = ".bin"
+) -> tuple[dict[int, Camera], dict[int, Image], dict[int, Point3D]]:
     if ext == ".txt":
         write_cameras_text(cameras, os.path.join(path, "cameras" + ext))
         write_images_text(images, os.path.join(path, "images" + ext))
@@ -521,7 +529,7 @@ def write_model(cameras, images, points3D, path, ext=".bin"):
     return cameras, images, points3D
 
 
-def qvec2rotmat(qvec):
+def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
     return np.array(
         [
             [
@@ -543,7 +551,7 @@ def qvec2rotmat(qvec):
     )
 
 
-def rotmat2qvec(R):
+def rotmat2qvec(R: np.ndarray) -> np.ndarray:
     Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
     K = (
         np.array(
@@ -563,43 +571,49 @@ def rotmat2qvec(R):
     return qvec
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Read and write COLMAP binary and text models"
-    )
-    parser.add_argument("--input_model", help="path to input model folder")
-    parser.add_argument(
-        "--input_format",
-        choices=[".bin", ".txt"],
-        help="input model format",
-        default="",
-    )
-    parser.add_argument("--output_model", help="path to output model folder")
-    parser.add_argument(
-        "--output_format",
-        choices=[".bin", ".txt"],
-        help="output model format",
-        default=".txt",
-    )
-    args = parser.parse_args()
+@dataclass
+class ColmapConfig:
+    """Configuration for COLMAP model conversion."""
+    
+    input_model: str
+    """Path to input model folder"""
+    
+    input_format: str = ""
+    """Input model format: .bin or .txt (auto-detect if empty)"""
+    
+    output_model: str | None = None
+    """Path to output model folder"""
+    
+    output_format: str = ".txt"
+    """Output model format: .bin or .txt"""
 
-    cameras, images, points3D = read_model(
-        path=args.input_model, ext=args.input_format
-    )
+
+def main(config: ColmapConfig) -> None:
+    """Read and write COLMAP binary and text models.
+    
+    :param config: Configuration for COLMAP model conversion
+    """
+    result = read_model(path=config.input_model, ext=config.input_format)
+    
+    if result is None:
+        print("Failed to read model")
+        return
+        
+    cameras, images, points3D = result
 
     print("num_cameras:", len(cameras))
     print("num_images:", len(images))
     print("num_points3D:", len(points3D))
 
-    if args.output_model is not None:
+    if config.output_model is not None:
         write_model(
             cameras,
             images,
             points3D,
-            path=args.output_model,
-            ext=args.output_format,
+            path=config.output_model,
+            ext=config.output_format,
         )
 
 
 if __name__ == "__main__":
-    main()
+    tyro.cli(main)
