@@ -14,6 +14,8 @@ dependencies = [
   "fastapi>=0.115.8",
   "uvicorn>=0.34.0",
   "moge",
+  "tyro>=0.9.31",
+  "huggingface_hub>=0.20.0",
 ]
 description = "Densifier a colmap pc using depth map"
 name = "depthdensifier"

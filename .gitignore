@@ -205,3 +205,49 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# DepthDensifier specific
+# Data directories and downloaded files
+data/
+datasets/
+models/
+outputs/
+temp/
+results/
+
+# Downloaded archives
+*.zip
+*.tar.gz
+*.tar.bz2
+*.7z
+
+# Large files and datasets
+*.bin
+*.ckpt
+*.pth
+*.safetensors
+*.h5
+*.hdf5
+
+# Point cloud files
+*.ply
+*.pcd
+*.las
+*.xyz
+
+# Image/video files (when large)
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# COLMAP specific files
+colmap_*
+sparse/
+dense/
+images/
+cameras.txt
+images.txt
+points3D.txt
+
+.cursor/
