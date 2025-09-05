@@ -16,6 +16,8 @@ dependencies = [
   "moge",
   "tyro>=0.9.31",
   "huggingface_hub>=0.20.0",
+  "cupy>=13.6.0",
+  "pycolmap>=3.12.5",
 ]
 description = "Densifier a colmap pc using depth map"
 name = "depthdensifier"
