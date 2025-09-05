@@ -1,0 +1,39 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[project]
+dependencies = [
+  "torch>=1.9.0",
+  "einops>=0.6.1",
+  "Pillow>=9.5.0",
+  "torchvision>=0.10.0",
+  "matplotlib>=3.5.3",
+  "scipy>=1.7.3",
+  "tqdm>=4.65.2",
+  "fastapi>=0.115.8",
+  "uvicorn>=0.34.0",
+  "moge",
+]
+description = "Densifier a colmap pc using depth map"
+name = "depthdensifier"
+readme = "README.md"
+requires-python = ">=3.12"
+version = "0.1.0"
+
+[tool.uv.sources]
+torch = [
+  {index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'"},
+]
+torchvision = [
+  {index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'"},
+]
+moge = { git = "https://github.com/microsoft/MoGe.git", subdirectory = "." }
+
+[[tool.uv.index]]
+explicit = true
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/depthdensifier"]
