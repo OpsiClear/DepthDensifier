@@ -9,6 +9,7 @@ import time
 
 # Import the refiner from your source directory
 from depthdensifier.refiner import DepthRefiner, cp, device as refiner_device
+from depthdensifier.simple_refiner import SimpleRefiner
 from depthdensifier.initilizer import compute_image_gradients_gpu
 
 # ==============================================================================
@@ -43,7 +44,7 @@ REFINER_CONFIG = {
 }
 def generate_saliency_mask(
     image_tensor: torch.Tensor,
-    gradient_threshold_percentile: float = 50.0,
+    gradient_threshold_percentile: float = 90.0,
 ) -> np.ndarray:
     """
     Generates a binary saliency mask based on image gradients.
@@ -132,15 +133,15 @@ def main():
     # --- 3. Initialize the Depth Refiner ---
     step_start_time = time.time()
     print("Initializing Depth Refiner...")
-    refiner = DepthRefiner(**REFINER_CONFIG)
-    print(f"-> Depth Refiner initialized in {time.time() - step_start_time:.2f}s.")
-    
+    # refiner = DepthRefiner(**REFINER_CONFIG)
+    # print(f"-> Depth Refiner initialized in {time.time() - step_start_time:.2f}s.")
+    refiner = SimpleRefiner()
     # --- 4. Process each image: Infer, Refine, and Densify ---
     processing_start_time = time.time()
     all_dense_points = []
+    all_unrefined_points = []
     num_points = 0
     image_list = [img for img in rec.images.values() if img.has_pose]
-    image_list = image_list[:2]
     for image in tqdm(image_list, desc="Refining and Densifying"):
         per_image_start_time = time.time()
         
@@ -188,21 +189,19 @@ def main():
         step_start_time = time.time()
         camera = rec.cameras[image.camera_id]
         camera.rescale(new_width=new_w, new_height=new_h)
-        rec.cameras[image.camera_id] = camera
         if REFINER_CONFIG['verbose'] > 0:
             print(f"\n--- Refining depth for {image.name} (ID: {image.image_id}) ---")
 
-        refinement_results = refiner.refine_depth(
+        refinement_results = refiner.refine(
             depth_map=moge_depth,
-            normal_map=moge_normal,
-            points3D=points3D_world,
-            cam_from_world=image.cam_from_world().matrix(),
-            K=camera.calibration_matrix(),
             mask=moge_mask,
+            points3D_world=points3D_world,
+            image=image,
+            camera=camera,
         )
-        if refinement_results['num_iterations'] == 50:
-            print(f"  - Depth Refinement: {time.time() - step_start_time:.2f}s")
-            continue
+        # if refinement_results['num_iterations'] == 50:
+        #     print(f"  - Depth Refinement: {time.time() - step_start_time:.2f}s")
+        #     continue
         if REFINER_CONFIG['verbose'] > 0:
             print(f"  - Depth Refinement: {time.time() - step_start_time:.2f}s")
         
@@ -214,10 +213,18 @@ def main():
         pixels_y, pixels_x = np.mgrid[0:h:DOWNSAMPLE_DENSITY, 0:w:DOWNSAMPLE_DENSITY]
         valid_pixels = moge_mask[pixels_y, pixels_x].astype(bool) & saliency_mask[pixels_y, pixels_x]
         
-        pixels_x, pixels_y = pixels_x[valid_pixels], pixels_y[valid_pixels]
-        depth_values = refined_depth[pixels_y, pixels_x]
+        pixels_x_valid, pixels_y_valid = pixels_x[valid_pixels], pixels_y[valid_pixels]
         
-        points2D = np.stack([pixels_x, pixels_y], axis=-1)
+        # --- [DEBUG] Unproject unrefined depth for comparison ---
+        depth_values_unrefined = moge_depth[pixels_y_valid, pixels_x_valid]
+        points2D_unrefined = np.stack([pixels_x_valid, pixels_y_valid], axis=-1)
+        points3D_camera_unrefined = unproject_points(points2D_unrefined, depth_values_unrefined, camera)
+        points3D_world_unrefined = image.cam_from_world().inverse() * points3D_camera_unrefined
+        all_unrefined_points.append(points3D_world_unrefined)
+        
+        depth_values = refined_depth[pixels_y_valid, pixels_x_valid]
+        
+        points2D = np.stack([pixels_x_valid, pixels_y_valid], axis=-1)
         points3D_camera = unproject_points(points2D, depth_values, camera)
         points3D_world = image.cam_from_world().inverse() * points3D_camera
         if REFINER_CONFIG['verbose'] > 0:
@@ -264,11 +271,18 @@ def main():
         for pid in old_point3D_ids:
             rec.points3D[pid].color = np.array([255, 0, 0])
         print(f"-> Old points removed in {time.time() - step_start_time:.2f}s.")
+        
+        # # --- [DEBUG] Add unrefined points (green) ---
+        # if all_unrefined_points:
+        #     unrefined_point_cloud = np.concatenate(all_unrefined_points, axis=0)
+        #     print(f"Adding {len(unrefined_point_cloud)} new unrefined (green) points...")
+        #     for xyz in unrefined_point_cloud:
+        #         rec.add_point3D(xyz=xyz, track=pycolmap.Track(), color=np.array([0, 255, 0]))
 
         step_start_time = time.time()
         print(f"Adding {len(final_point_cloud)} new dense points...")
         for xyz in final_point_cloud:
-            rec.add_point3D(xyz=xyz, track=pycolmap.Track(), color=np.array([128, 128, 128]))
+            rec.add_point3D(xyz=xyz, track=pycolmap.Track(), color=np.array([0, 0, 0]))
         print(f"-> New points added in {time.time() - step_start_time:.2f}s.")
 
         step_start_time = time.time()
