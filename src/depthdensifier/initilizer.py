@@ -233,6 +233,192 @@ def compute_image_gradients_gpu(image: torch.Tensor) -> torch.Tensor:
     return combined_gradient
 
 
+def compute_depth_normal_gradient_mask(
+    depth_map: torch.Tensor,
+    normal_map: torch.Tensor | None = None,
+    depth_threshold: float = 0.2,
+    normal_threshold: float = 0.3,
+    edge_sigma: float = 1.0,
+) -> torch.Tensor:
+    """
+    Compute mask of high gradient regions in depth and normal maps.
+    
+    :param depth_map: Depth map tensor [H, W]
+    :param normal_map: Optional normal map tensor [H, W, 3] or [3, H, W]
+    :param depth_threshold: Threshold for depth gradient filtering
+    :param normal_threshold: Threshold for normal gradient filtering
+    :param edge_sigma: Gaussian smoothing sigma before gradient computation
+    :return: Boolean mask tensor [H, W] where True indicates high-gradient regions to exclude
+    """
+    device = depth_map.device
+    h, w = depth_map.shape[-2:]
+    
+    # Initialize edge mask
+    edge_mask = torch.zeros((h, w), dtype=torch.bool, device=device)
+    
+    # Depth gradient filtering
+    if depth_map is not None:
+        # Apply Gaussian smoothing
+        depth_smooth = depth_map
+        if edge_sigma > 0:
+            # Create Gaussian kernel
+            kernel_size = int(2 * edge_sigma * 3) + 1  # 3-sigma rule
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            
+            # Simple Gaussian blur using conv2d
+            sigma_tensor = torch.tensor(edge_sigma, device=device, dtype=depth_map.dtype)
+            x = torch.arange(kernel_size, device=device, dtype=depth_map.dtype) - kernel_size // 2
+            gaussian_1d = torch.exp(-0.5 * (x / sigma_tensor) ** 2)
+            gaussian_1d = gaussian_1d / gaussian_1d.sum()
+            
+            # Apply separable Gaussian filter
+            kernel_x = gaussian_1d.view(1, 1, 1, kernel_size)
+            kernel_y = gaussian_1d.view(1, 1, kernel_size, 1)
+            
+            depth_input = depth_map.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+            depth_smooth = torch.nn.functional.conv2d(depth_input, kernel_x, padding=(0, kernel_size//2))
+            depth_smooth = torch.nn.functional.conv2d(depth_smooth, kernel_y, padding=(kernel_size//2, 0))
+            depth_smooth = depth_smooth.squeeze(0).squeeze(0)  # [H, W]
+        
+        # Compute depth gradients using Sobel operators
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                              dtype=depth_map.dtype, device=device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                              dtype=depth_map.dtype, device=device).view(1, 1, 3, 3)
+        
+        depth_input = depth_smooth.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+        dx = torch.nn.functional.conv2d(depth_input, sobel_x, padding=1).squeeze()
+        dy = torch.nn.functional.conv2d(depth_input, sobel_y, padding=1).squeeze()
+        
+        depth_grad_mag = torch.sqrt(dx**2 + dy**2)
+        
+        # Normalize by depth (relative gradient)
+        relative_grad = depth_grad_mag / (depth_smooth + 1e-6)
+        
+        # Create depth edge mask
+        depth_edge_mask = relative_grad > depth_threshold
+        edge_mask |= depth_edge_mask
+    
+    # Normal gradient filtering
+    if normal_map is not None:
+        # Ensure normal_map is [H, W, 3]
+        if normal_map.dim() == 3 and normal_map.shape[0] == 3:
+            normal_map = normal_map.permute(1, 2, 0)  # [3, H, W] -> [H, W, 3]
+        
+        # Compute normal gradient magnitude for each component
+        nx_grad_x = torch.gradient(normal_map[..., 0], dim=1)[0]
+        nx_grad_y = torch.gradient(normal_map[..., 0], dim=0)[0]
+        ny_grad_x = torch.gradient(normal_map[..., 1], dim=1)[0]
+        ny_grad_y = torch.gradient(normal_map[..., 1], dim=0)[0]
+        nz_grad_x = torch.gradient(normal_map[..., 2], dim=1)[0]
+        nz_grad_y = torch.gradient(normal_map[..., 2], dim=0)[0]
+        
+        # Compute total normal gradient magnitude
+        normal_grad_mag = torch.sqrt(
+            nx_grad_x**2 + nx_grad_y**2 +
+            ny_grad_x**2 + ny_grad_y**2 +
+            nz_grad_x**2 + nz_grad_y**2
+        )
+        
+        # Create normal edge mask
+        normal_edge_mask = normal_grad_mag > normal_threshold
+        edge_mask |= normal_edge_mask
+    
+    return edge_mask
+
+
+def filter_gaussians_by_gradients(
+    gaussians: dict[str, torch.Tensor],
+    depth_map: torch.Tensor | None = None,
+    normal_map: torch.Tensor | None = None,
+    depth_threshold: float = 0.2,
+    normal_threshold: float = 0.3,
+    edge_sigma: float = 1.0,
+    img_h: int | None = None,
+    img_w: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """
+    Filter out Gaussians from high gradient regions in depth/normal maps.
+    
+    :param gaussians: Dictionary containing Gaussian parameters with 'xy', 'scale', 'rot', 'feat'
+    :param depth_map: Optional depth map tensor [H, W]
+    :param normal_map: Optional normal map tensor [H, W, 3] or [3, H, W]
+    :param depth_threshold: Threshold for depth gradient filtering
+    :param normal_threshold: Threshold for normal gradient filtering
+    :param edge_sigma: Gaussian smoothing sigma before gradient computation
+    :param img_h: Image height (required if depth_map or normal_map provided)
+    :param img_w: Image width (required if depth_map or normal_map provided)
+    :return: Filtered dictionary of Gaussian parameters
+    """
+    # If no depth or normal maps provided, return original gaussians
+    if depth_map is None and normal_map is None:
+        return gaussians
+    
+    # Get image dimensions
+    if depth_map is not None:
+        h, w = depth_map.shape[-2:]
+    elif normal_map is not None:
+        if normal_map.dim() == 3 and normal_map.shape[0] == 3:
+            h, w = normal_map.shape[-2:]
+        else:
+            h, w = normal_map.shape[:2]
+    else:
+        if img_h is None or img_w is None:
+            raise ValueError("img_h and img_w must be provided if depth_map and normal_map are None")
+        h, w = img_h, img_w
+    
+    # Compute gradient mask
+    edge_mask = compute_depth_normal_gradient_mask(
+        depth_map if depth_map is not None else torch.zeros((h, w), device=gaussians["xy"].device),
+        normal_map,
+        depth_threshold,
+        normal_threshold,
+        edge_sigma,
+    )
+    
+    # Convert Gaussian positions to pixel coordinates
+    xy = gaussians["xy"]  # [N, 2] in [0, 1] range
+    
+    # Convert to pixel coordinates [0, w) x [0, h)
+    pixel_x = (xy[:, 0] * w).long().clamp(0, w - 1)
+    pixel_y = (xy[:, 1] * h).long().clamp(0, h - 1)
+    
+    # Check which Gaussians are in high-gradient regions
+    gaussian_in_edge = edge_mask[pixel_y, pixel_x]
+    
+    # Keep only Gaussians NOT in high-gradient regions
+    keep_mask = ~gaussian_in_edge
+    
+    if keep_mask.sum() == 0:
+        # If all Gaussians would be filtered out, keep at least some
+        print("Warning: All Gaussians would be filtered out by gradient filtering. Keeping 10% with lowest gradients.")
+        # Keep 10% of Gaussians with lowest gradient values at their positions
+        if depth_map is not None:
+            gradient_values = compute_depth_normal_gradient_mask(
+                depth_map, normal_map, depth_threshold * 10, normal_threshold * 10, edge_sigma
+            ).float()
+            gaussian_gradients = gradient_values[pixel_y, pixel_x]
+            _, keep_indices = torch.topk(gaussian_gradients, k=max(1, len(gaussian_gradients) // 10), largest=False)
+            keep_mask = torch.zeros_like(keep_mask)
+            keep_mask[keep_indices] = True
+        else:
+            # Fallback: keep every 10th Gaussian
+            keep_mask = torch.zeros_like(keep_mask)
+            keep_mask[::10] = True
+    
+    # Filter all Gaussian parameters
+    filtered_gaussians = {}
+    for key, values in gaussians.items():
+        filtered_gaussians[key] = values[keep_mask]
+    
+    num_original = len(gaussians["xy"])
+    num_filtered = len(filtered_gaussians["xy"])
+    print(f"Filtered {num_original - num_filtered} Gaussians from high-gradient regions ({num_filtered}/{num_original} remaining)")
+    
+    return filtered_gaussians
+
+
 def compute_gradient_map(
     gt_images: torch.Tensor,
     gamma: float,
@@ -379,6 +565,12 @@ def initialize_gaussians(
     dtype: torch.dtype = torch.float32,
     disable_color_init: bool = False,
     log_dir: str | Path | None = None,
+    depth_map: torch.Tensor | None = None,
+    normal_map: torch.Tensor | None = None,
+    filter_high_gradients: bool = True,
+    depth_gradient_threshold: float = 0.2,
+    normal_gradient_threshold: float = 0.3,
+    gradient_edge_sigma: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """
     Initialize 2D Gaussians for image reconstruction.
@@ -395,6 +587,12 @@ def initialize_gaussians(
     :param dtype: Data type for tensors
     :param disable_color_init: If True, skip color initialization
     :param log_dir: Directory to save initialization visualizations
+    :param depth_map: Optional depth map tensor [H, W] from MOGE for gradient filtering
+    :param normal_map: Optional normal map tensor [H, W, 3] or [3, H, W] from MOGE for gradient filtering
+    :param filter_high_gradients: Whether to filter out Gaussians from high-gradient regions
+    :param depth_gradient_threshold: Threshold for depth gradient filtering (higher = more aggressive)
+    :param normal_gradient_threshold: Threshold for normal gradient filtering (higher = more aggressive)
+    :param gradient_edge_sigma: Gaussian smoothing sigma before gradient computation
     :return: Dictionary containing Gaussian parameters
     
     Usage example:
@@ -403,7 +601,7 @@ def initialize_gaussians(
         gt_images = torch.from_numpy(images).to("cuda")
         img_h, img_w = gt_images.shape[1], gt_images.shape[2]
         
-        # Initialize with gradient-based placement
+        # Initialize with gradient-based placement and depth/normal filtering
         gaussians = initialize_gaussians(
             gt_images=gt_images,
             num_gaussians=10000,
@@ -414,17 +612,22 @@ def initialize_gaussians(
             init_scale=5.0,
             gamma=2.2,
             device="cuda",
-            log_dir="logs/"
+            log_dir="logs/",
+            depth_map=depth_tensor,  # From MOGE
+            normal_map=normal_tensor,  # From MOGE
+            filter_high_gradients=True,
+            depth_gradient_threshold=0.2,
+            normal_gradient_threshold=0.3
         )
         
-        # Initialize with random placement
-        gaussians_random = initialize_gaussians(
+        # Initialize without filtering
+        gaussians_no_filter = initialize_gaussians(
             gt_images=gt_images,
             num_gaussians=5000,
             img_h=img_h,
             img_w=img_w,
             init_mode="random",
-            disable_color_init=False
+            filter_high_gradients=False
         )
         
         # Access Gaussian parameters
@@ -460,7 +663,23 @@ def initialize_gaussians(
         num_channels = gt_images.shape[0]
         feat = torch.rand((num_gaussians, num_channels), dtype=dtype, device=device)
 
-    return {"xy": xy, "scale": scale, "rot": rot, "feat": feat}
+    # Create initial Gaussian dictionary
+    gaussians = {"xy": xy, "scale": scale, "rot": rot, "feat": feat}
+    
+    # Apply gradient-based filtering if requested and maps are provided
+    if filter_high_gradients and (depth_map is not None or normal_map is not None):
+        gaussians = filter_gaussians_by_gradients(
+            gaussians=gaussians,
+            depth_map=depth_map,
+            normal_map=normal_map,
+            depth_threshold=depth_gradient_threshold,
+            normal_threshold=normal_gradient_threshold,
+            edge_sigma=gradient_edge_sigma,
+            img_h=img_h,
+            img_w=img_w,
+        )
+
+    return gaussians
 
 
 def initialize_from_checkpoint(checkpoint_path: str | Path) -> dict[str, Any]:
@@ -495,6 +714,18 @@ class InitializerConfig:
 
     gamma: float = 1.0
     """Gamma correction value"""
+    
+    filter_high_gradients: bool = True
+    """Whether to filter out Gaussians from high-gradient regions"""
+    
+    depth_gradient_threshold: float = 0.2
+    """Threshold for depth gradient filtering (higher = more aggressive)"""
+    
+    normal_gradient_threshold: float = 0.3
+    """Threshold for normal gradient filtering (higher = more aggressive)"""
+    
+    gradient_edge_sigma: float = 1.0
+    """Gaussian smoothing sigma before gradient computation"""
 
 
 def main(config: InitializerConfig) -> None:
