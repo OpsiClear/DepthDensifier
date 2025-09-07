@@ -16,8 +16,10 @@ dependencies = [
   "moge",
   "tyro>=0.9.31",
   "huggingface_hub>=0.20.0",
-  "cupy-cuda12x>=13.6.0",
   "pycolmap>=3.12.5",
+  "plotly>=6.3.0",
+  "scikit-learn>=1.7.1",
+  "numba>=0.61.2",
 ]
 description = "Densifier a colmap pc using depth map"
 name = "depthdensifier"

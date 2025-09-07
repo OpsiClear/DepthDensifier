@@ -251,3 +251,5 @@ images.txt
 points3D.txt
 
 .cursor/
+
+uv.lock
