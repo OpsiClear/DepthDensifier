@@ -16,6 +16,8 @@ import pycolmap
 import torch
 from scipy.ndimage import gaussian_filter, binary_dilation, median_filter
 
+from .utils import load_colmap_model
+
 
 @dataclass
 class FastPCHIPRefinerConfig:
@@ -289,6 +291,10 @@ class FastPCHIPRefiner:
         threshold = self.outlier_threshold * mad
         inliers = np.abs(residuals - np.median(residuals)) < threshold
         
+        if self.verbose > 1:
+            print(f"[FastPCHIP] Outlier removal: median_ratio={median_ratio:.6f}, mad={mad:.6f}, threshold={threshold:.6f}")
+            print(f"[FastPCHIP] Inliers: {inliers.sum()}/{len(inliers)}")
+        
         return z_colmap[inliers], z_depth[inliers], (~inliers).sum()
     
     def _pchip_interpolate_torch(
@@ -470,6 +476,14 @@ class FastPCHIPRefiner:
             ~edge_mask[v, u]  # Exclude edge pixels
         )
         
+        if self.verbose > 1:
+            print(f"[FastPCHIP] Correspondence filtering:")
+            print(f"  - depths_sampled > 0: {(depths_sampled > 0).sum()}")
+            print(f"  - depths3d_valid > 0: {(depths3d_valid > 0).sum()}")
+            print(f"  - isfinite(depths_sampled): {np.isfinite(depths_sampled).sum()}")
+            print(f"  - ~edge_mask[v, u]: {(~edge_mask[v, u]).sum()}")
+            print(f"  - Final valid_corr: {valid_corr.sum()}")
+        
         z_depth = depths_sampled[valid_corr]
         z_colmap = depths3d_valid[valid_corr]
         
@@ -566,14 +580,6 @@ class FastPCHIPRefiner:
 
 
 # Convenience functions for compatibility
-def load_colmap_model(model_path: str | Path) -> pycolmap.Reconstruction:
-    """Load COLMAP reconstruction from path."""
-    if Path(model_path).is_dir():
-        return pycolmap.Reconstruction(model_path)
-    else:
-        reconstruction = pycolmap.Reconstruction()
-        reconstruction.read_binary(model_path)
-        return reconstruction
 
 
 def refine_depth_from_colmap(
