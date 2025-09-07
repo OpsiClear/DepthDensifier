@@ -62,8 +62,8 @@ class DownloadConfig:
     download_moge_models: bool = True
     """Download MoGe pretrained models"""
 
-    moge_models: str = "all"
-    """Which MoGe models to download: 'all', 'recommended', 'v1', 'v2', or comma-separated model names"""
+    moge_models: str = "recommended"
+    """Which MoGe models to download: 'recommended' (moge-2-vitl-normal only), 'all', or comma-separated model names"""
 
 
 
@@ -181,51 +181,16 @@ def get_moge_models() -> list[MoGeModelConfig]:
 
     :return: List of MoGe model configurations
     """
+    # Only return the model that's actually used in the codebase
     return [
-        {
-            "name": "moge-vitl",
-            "repo_id": "Ruicheng/moge-vitl",
-            "description": "MoGe-1 ViT-Large model",
-            "version": "v1",
-            "metric_scale": False,
-            "normal_map": False,
-            "params": "314M",
-        },
-        {
-            "name": "moge-2-vitl",
-            "repo_id": "Ruicheng/moge-2-vitl",
-            "description": "MoGe-2 ViT-Large with metric scale",
-            "version": "v2",
-            "metric_scale": True,
-            "normal_map": False,
-            "params": "326M",
-        },
         {
             "name": "moge-2-vitl-normal",
             "repo_id": "Ruicheng/moge-2-vitl-normal",
-            "description": "MoGe-2 ViT-Large with metric scale and normal maps",
+            "description": "MoGe-2 ViT-Large with metric scale and normal maps (RECOMMENDED)",
             "version": "v2",
             "metric_scale": True,
             "normal_map": True,
             "params": "331M",
-        },
-        {
-            "name": "moge-2-vitb-normal",
-            "repo_id": "Ruicheng/moge-2-vitb-normal",
-            "description": "MoGe-2 ViT-Base with metric scale and normal maps",
-            "version": "v2",
-            "metric_scale": True,
-            "normal_map": True,
-            "params": "104M",
-        },
-        {
-            "name": "moge-2-vits-normal",
-            "repo_id": "Ruicheng/moge-2-vits-normal",
-            "description": "MoGe-2 ViT-Small with metric scale and normal maps",
-            "version": "v2",
-            "metric_scale": True,
-            "normal_map": True,
-            "params": "35M",
         },
     ]
 
@@ -268,17 +233,11 @@ def main(config: DownloadConfig) -> None:
         available_models = get_moge_models()
 
         # Select models based on config
-        if config.moge_models == "all":
+        if config.moge_models == "all" or config.moge_models == "recommended":
+            # Since we only have one model now, both options download the same model
             selected_models = available_models
-        elif config.moge_models == "recommended":
-            selected_models = [
-                m for m in available_models if m["name"] == "moge-2-vitl-normal"
-            ]
-        elif config.moge_models == "v1":
-            selected_models = [m for m in available_models if m["version"] == "v1"]
-        elif config.moge_models == "v2":
-            selected_models = [m for m in available_models if m["version"] == "v2"]
         else:
+            # Allow specifying model name explicitly if needed
             model_names = [name.strip() for name in config.moge_models.split(",")]
             selected_models = [m for m in available_models if m["name"] in model_names]
 
