@@ -76,25 +76,175 @@ class ScriptConfig:
     filtering: FilteringConfig = field(default_factory=FilteringConfig)
 
 
-def project_points(
-    points3d: np.ndarray, image: pycolmap.Image, camera: pycolmap.Camera
-) -> tuple[np.ndarray, np.ndarray]:
-    """Projects 3D points to the image plane for a given camera."""
-    # World to camera transformation
-    cam_from_world = image.cam_from_world().matrix()
-    points3d_h = np.hstack([points3d, np.ones((len(points3d), 1))])
-    points_cam_h = (cam_from_world @ points3d_h.T).T
+class FloaterFilter:
+    """
+    A class to filter floater points from a dense point cloud using multi-view
+    consistency, accelerated on the GPU with PyTorch.
+    """
 
-    points_cam = points_cam_h[:, :3]
-    depths = points_cam[:, 2]
+    def __init__(self, config: FilteringConfig, device: torch.device):
+        """
+        Initializes the FloaterFilter.
 
-    # Camera to image plane projection
-    points_cam_normalized = points_cam / (depths[:, np.newaxis] + 1e-8)
+        :param config: A dataclass object containing filtering parameters
+                       (e.g., vote_threshold, depth_threshold).
+        :param device: The torch.device (e.g., 'cuda' or 'cpu') to run on.
+        """
+        self.config = config
+        self.device = device
 
-    K = camera.calibration_matrix()
-    points2d_h = (K @ points_cam_normalized.T).T
-    points2d = points2d_h[:, :2]
-    return points2d, depths
+    def _project_points_torch(
+        self,
+        points3d_world: torch.Tensor,
+        cam_from_world: torch.Tensor,
+        K: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Projects 3D world points to 2D image coordinates using PyTorch.
+
+        :param points3d_world: Tensor of 3D points in world coordinates (N, 3).
+        :param cam_from_world: Camera-from-world transformation matrix (4, 4).
+        :param K: Camera intrinsics matrix (3, 3).
+        :return: A tuple of (points2d, depths) in image coordinates.
+        """
+        points3d_h = torch.cat(
+            [points3d_world, torch.ones_like(points3d_world[:, :1])], dim=1
+        )
+        points_cam_h = (cam_from_world @ points3d_h.T).T
+
+        points_cam = points_cam_h[:, :3]
+        depths = points_cam[:, 2]
+
+        # Camera to image plane projection
+        points_cam_normalized = points_cam / (depths.unsqueeze(1) + 1e-8)
+
+        points2d_h = (K @ points_cam_normalized.T).T
+        points2d = points2d_h[:, :2]
+
+        return points2d, depths
+
+    @torch.no_grad()
+    def filter(
+        self,
+        point_cloud: np.ndarray,
+        colors: np.ndarray,
+        normals: np.ndarray,
+        cached_refinement_data: dict,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Filters the point cloud for floaters.
+
+        :param point_cloud: The dense point cloud (N, 3).
+        :param colors: The colors for each point (N, 3).
+        :param normals: The normals for each point (N, 3).
+        :param cached_refinement_data: Dictionary of refinement data per image.
+        :return: A tuple of (filtered_points, filtered_colors, filtered_normals).
+        """
+
+        if not torch.cuda.is_available() or self.device.type == "cpu":
+            logger.warning(
+                "Filtering on CPU. This may be slow. For GPU acceleration, ensure CUDA is available."
+            )
+
+        points_t = torch.from_numpy(point_cloud).float().to(self.device)
+        normals_t = torch.from_numpy(normals).float().to(self.device)
+        floater_votes_t = torch.zeros(
+            len(points_t), dtype=torch.int32, device=self.device
+        )
+
+        for data in tqdm(cached_refinement_data.values(), desc="Filtering Points (GPU)"):
+            refined_depth = (
+                torch.from_numpy(data["refined_depth"]).float().to(self.device)
+            )
+            h, w = refined_depth.shape
+
+            cam_from_world_t = (
+                torch.from_numpy(data["image"].cam_from_world().matrix())
+                .float()
+                .to(self.device)
+            )
+            K_t = (
+                torch.from_numpy(data["camera"].calibration_matrix())
+                .float()
+                .to(self.device)
+            )
+
+            points2d_t, depths_t = self._project_points_torch(
+                points_t, cam_from_world_t, K_t
+            )
+
+            cam_center = (
+                torch.from_numpy(data["image"].projection_center())
+                .float()
+                .to(self.device)
+            )
+            viewing_dirs = torch.nn.functional.normalize(
+                points_t - cam_center, p=2, dim=1
+            )
+            dot_products = torch.sum(normals_t * -viewing_dirs, dim=1)
+            not_grazing_mask = (
+                dot_products > self.config.grazing_angle_threshold
+            )
+
+            u, v = points2d_t[:, 0], points2d_t[:, 1]
+
+            mask_in_bounds = (
+                (u >= 0)
+                & (u < w)
+                & (v >= 0)
+                & (v < h)
+                & (depths_t > 0)
+                & not_grazing_mask
+            )
+
+            if not torch.any(mask_in_bounds):
+                continue
+
+            u_norm = (u[mask_in_bounds] / (w - 1)) * 2 - 1
+            v_norm = (v[mask_in_bounds] / (h - 1)) * 2 - 1
+            grid = torch.stack([u_norm, v_norm], dim=1).unsqueeze(0).unsqueeze(0)
+
+            refined_depths_at_projections = torch.nn.functional.grid_sample(
+                refined_depth.unsqueeze(0).unsqueeze(0),
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            ).squeeze()
+
+            projected_depths_valid = depths_t[mask_in_bounds]
+            valid_lookup_mask = refined_depths_at_projections > 0
+
+            inconsistent_mask = (
+                projected_depths_valid[valid_lookup_mask]
+                < self.config.depth_threshold
+                * refined_depths_at_projections[valid_lookup_mask]
+            )
+
+            original_indices = torch.where(mask_in_bounds)[0]
+            indices_with_valid_lookup = original_indices[valid_lookup_mask]
+            inconsistent_indices = indices_with_valid_lookup[inconsistent_mask]
+
+            floater_votes_t.scatter_add_(
+                0,
+                inconsistent_indices,
+                torch.ones_like(inconsistent_indices, dtype=torch.int32),
+            )
+
+        points_to_keep_mask = floater_votes_t < self.config.vote_threshold
+        num_removed = torch.sum(~points_to_keep_mask).item()
+        num_total = len(points_t)
+        if num_total > 0:
+            logger.info(
+                f"-> Filtering removed {num_removed} points ({num_removed / num_total * 100:.2f}%)"
+            )
+
+        keep_mask_np = points_to_keep_mask.cpu().numpy()
+        return (
+            point_cloud[keep_mask_np],
+            colors[keep_mask_np],
+            normals[keep_mask_np],
+        )
 
 
 def unproject_points(points2D, depth, camera: pycolmap.Camera):
@@ -143,6 +293,14 @@ def main(config: ScriptConfig):
     refiner = DepthRefiner(**refiner_config)
     logger.info(
         f"-> Depth Refiner initialized in {time.time() - step_start_time:.2f}s."
+    )
+
+    # --- 3.5. Initialize the Floater Filter ---
+    step_start_time = time.time()
+    logger.info("Initializing Floater Filter...")
+    floater_filter = FloaterFilter(config.filtering, device)
+    logger.info(
+        f"-> Floater Filter initialized in {time.time() - step_start_time:.2f}s."
     )
 
     # --- 4. Process each image: Infer, Refine, and Densify ---
@@ -309,6 +467,7 @@ def main(config: ScriptConfig):
     logger.info(
         f"-> Image processing loop finished in {time.time() - processing_start_time:.2f}s."
     )
+    rec = pycolmap.Reconstruction(config.paths.recon_path)
 
     # --- 5. Save the final results ---
     saving_start_time = time.time()
@@ -321,99 +480,21 @@ def main(config: ScriptConfig):
             f"-> Point cloud concatenated in {time.time() - step_start_time:.2f}s."
         )
 
-        # --- Filter point cloud based on multi-view consistency ---
-        logger.info("--- Filtering point cloud for geometric consistency ---")
+        # --- Filter point cloud based on multi-view consistency (GPU) ---
+        logger.info("--- Filtering point cloud for geometric consistency (GPU) ---")
         filter_start_time = time.time()
 
-        floater_votes = np.zeros(len(final_point_cloud), dtype=int)
-
-        for data in tqdm(cached_refinement_data.values(), desc="Filtering Points"):
-            refined_depth = data["refined_depth"]
-            h, w = refined_depth.shape
-
-            # Project points into the current view
-            points2d, depths = project_points(
-                final_point_cloud, data["image"], data["camera"]
-            )
-
-            # --- Grazing Angle Check ---
-            # Calculate the viewing direction from the camera to each point.
-            cam_center = data["image"].projection_center()
-            viewing_dirs = final_point_cloud - cam_center
-            viewing_dirs /= np.linalg.norm(viewing_dirs, axis=1)[:, np.newaxis]
-
-            # Calculate the dot product between the point's normal and the viewing direction.
-            # A dot product close to zero means a grazing angle.
-            # We negate the viewing direction because the normal points "out" of the surface.
-            dot_products = np.sum(final_normals * -viewing_dirs, axis=1)
-
-            # Create a mask to only consider points that are not at a grazing angle.
-            # We use a configurable threshold to filter grazing angles
-            not_grazing_mask = dot_products > config.filtering.grazing_angle_threshold
-
-            u, v = points2d[:, 0], points2d[:, 1]
-
-            # Create a mask for points that project inside the image bounds AND are not at a grazing angle
-            mask_in_bounds = (
-                (u >= 0)
-                & (u < w)
-                & (v >= 0)
-                & (v < h)
-                & (depths > 0)
-                & not_grazing_mask
-            )
-
-            if not np.any(mask_in_bounds):
-                continue
-
-            # Get integer coordinates for depth lookup
-            u_valid = u[mask_in_bounds].astype(int)
-            v_valid = v[mask_in_bounds].astype(int)
-
-            projected_depths_valid = depths[mask_in_bounds]
-            refined_depths_at_projections = refined_depth[v_valid, u_valid]
-
-            # Create a mask for where the lookup is valid (non-zero depth)
-            valid_lookup_mask = refined_depths_at_projections > 0
-
-            # A point is a "floater" if its projected depth is significantly
-            # LESS than the depth map's value (i.e., it's between the camera and the surface).
-            inconsistent_mask = (
-                projected_depths_valid[valid_lookup_mask]
-                < config.filtering.depth_threshold
-                * refined_depths_at_projections[valid_lookup_mask]
-            )
-
-            # Get the original indices of inconsistent points and increment their vote count
-            original_indices_in_bounds = np.where(mask_in_bounds)[0]
-            indices_with_valid_lookup = original_indices_in_bounds[valid_lookup_mask]
-            inconsistent_indices = indices_with_valid_lookup[inconsistent_mask]
-
-            floater_votes[inconsistent_indices] += 1
-
-        points_to_keep_mask = floater_votes < config.filtering.vote_threshold
-        final_point_cloud = final_point_cloud[points_to_keep_mask]
-        final_colors = final_colors[points_to_keep_mask]
-        num_removed = np.sum(~points_to_keep_mask)
-        logger.info(
-            f"-> Filtering removed {num_removed} points ({num_removed / len(points_to_keep_mask) * 100:.2f}%)"
+        final_point_cloud, final_colors, final_normals = floater_filter.filter(
+            point_cloud=final_point_cloud,
+            colors=final_colors,
+            normals=final_normals,
+            cached_refinement_data=cached_refinement_data,
         )
+
         logger.info(f"-> Filtering finished in {time.time() - filter_start_time:.2f}s.")
 
         # --- Update the reconstruction object and save as COLMAP model ---
         step_start_time = time.time()
-        # logger.info(f"Removing {rec.num_points3D()} old sparse points...")
-        # old_point3D_ids = list(rec.points3D.keys())
-        # for pid in old_point3D_ids:
-        #     rec.points3D[pid].color = np.array([255, 0, 0])
-        # logger.info(f"-> Old points removed in {time.time() - step_start_time:.2f}s.")
-
-        # # --- [DEBUG] Add unrefined points (green) ---
-        # if all_unrefined_points:
-        #     unrefined_point_cloud = np.concatenate(all_unrefined_points, axis=0)
-        #     logger.debug(f"Adding {len(unrefined_point_cloud)} new unrefined (green) points...")
-        #     for xyz in unrefined_point_cloud:
-        #         rec.add_point3D(xyz=xyz, track=pycolmap.Track(), color=np.array([0, 255, 0]))
 
         step_start_time = time.time()
         logger.info(f"Adding {len(final_point_cloud)} new dense points...")

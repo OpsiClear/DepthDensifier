@@ -62,7 +62,7 @@ class DownloadConfig:
     download_moge_models: bool = True
     """Download MoGe pretrained models"""
 
-    moge_models: str = "recommended"
+    moge_models: str = "all"
     """Which MoGe models to download: 'recommended' (moge-2-vitl-normal only), 'all', or comma-separated model names"""
 
 
@@ -191,6 +191,24 @@ def get_moge_models() -> list[MoGeModelConfig]:
             "metric_scale": True,
             "normal_map": True,
             "params": "331M",
+        },
+        {
+            "name": "moge-2-vitb-normal",
+            "repo_id": "Ruicheng/moge-2-vitb-normal",
+            "description": "MoGe-2 ViT-Base with metric scale and normal maps (RECOMMENDED)",
+            "version": "v2",
+            "metric_scale": True,
+            "normal_map": True,
+            "params": "104M",
+        },
+        {
+            "name": "moge-2-vits-normal",
+            "repo_id": "Ruicheng/moge-2-vits-normal",
+            "description": "MoGe-2 ViT-Small with metric scale and normal maps (RECOMMENDED)",
+            "version": "v2",
+            "metric_scale": True,
+            "normal_map": True,
+            "params": "35M",
         },
     ]
 
