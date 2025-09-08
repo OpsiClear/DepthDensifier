@@ -1,284 +1,195 @@
 # DepthDensifier
 
-Densify a COLMAP point cloud using depth maps with Microsoft's MoGe (Monocular Geometry) integration.
+Densify COLMAP sparse point clouds using monocular depth estimation with Microsoft's MoGe (Monocular Geometry).
 
-## Features
+## Pipeline Strategy
 
-- COLMAP point cloud densification using depth estimation
-- Integration with Microsoft MoGe for monocular geometry estimation
-- FastAPI web interface for easy interaction
-- Modern Python packaging with `src/` layout
+The DepthDensifier pipeline employs a multi-stage approach to transform sparse COLMAP reconstructions into dense point clouds:
+
+### 1. **Depth Estimation with MoGe**
+   - Uses Microsoft's MoGe v2 models to predict metric-scale depth maps from single images
+   - Generates high-quality depth and normal maps for each input image
+   - Supports multiple model variants (ViT-Small/Base/Large) with different speed/quality tradeoffs
+
+### 2. **Depth Refinement with PCHIP Interpolation**
+   - Aligns MoGe depth predictions with COLMAP's sparse 3D points
+   - Uses GPU-accelerated PCHIP (Piecewise Cubic Hermite Interpolating Polynomial) for monotonic depth correction
+   - Preserves depth ordering while maintaining local consistency
+   - Optional FP16 processing for 2x speedup on modern GPUs
+
+### 3. **Dense Point Cloud Generation**
+   - Unprojects refined depth maps to 3D space
+   - Generates dense points with colors and normals
+   - Configurable density control via downsampling parameters
+
+### 4. **Multi-View Consistency Filtering**
+   - Projects points across multiple views to detect "floaters" (inconsistent points)
+   - Uses voting mechanism to identify and remove geometric inconsistencies
+   - Filters based on depth consistency and grazing angle thresholds
+
+### 5. **Optimizations**
+   - **Batch Processing**: Processes multiple images simultaneously on GPU
+   - **Async I/O**: Prefetches images while GPU processes current batch
+   - **Memory Management**: Pre-allocates arrays and clears GPU cache periodically
+   - **Vectorized Operations**: Uses NumPy/PyTorch vectorization throughout
 
 ## Installation
 
 ### Prerequisites
 
 - Python 3.12+
-- Git with Git LFS support
 - CUDA-compatible GPU (recommended for PyTorch acceleration)
+- Git with Git LFS support
 
-### Quick Install
+### Install with uv
 
-1. **Clone the repository:**
-   ```bash
-   git clone <your-repo-url>
-   cd DepthDensifier
-   ```
+This project uses [uv](https://docs.astral.sh/uv/) for dependency management. Install uv following the instructions at: https://docs.astral.sh/uv/getting-started/installation/
 
-2. **Install with uv (recommended):**
-   ```bash
-   # Install uv if you haven't already
-   pip install uv
-   
-   # Install the project and all dependencies
-   uv sync
-   ```
+Once uv is installed:
 
-3. **Alternative: Install with pip:**
-   ```bash
-   pip install -e .
-   ```
+```bash
+# Clone the repository
+git clone <your-repo-url>
+cd DepthDensifier
 
-### Dependencies
-
-This project includes several key dependencies:
-
-- **Core ML/CV Libraries:**
-  - PyTorch with CUDA support
-  - OpenCV for computer vision
-  - Pillow for image processing
-  - NumPy, SciPy for numerical computing
-
-- **3D Processing:**
-  - MoGe (Microsoft Monocular Geometry) - installed from GitHub
-  - utils3d for 3D utilities
-  - trimesh for mesh processing
-
-- **Web Interface:**
-  - FastAPI for REST API
-  - Gradio for interactive web UI
-  - Uvicorn as ASGI server
-
-### Git LFS Note
-
-The MoGe dependency uses Git LFS for large files. If you encounter LFS download issues, the installation automatically skips LFS files during dependency resolution. The core functionality will work without these files, which are typically example data and pre-trained models.
-
-### Development Setup
-
-For development, the project uses a modern `src/` layout:
-
-```
-DepthDensifier/
-├── src/
-│   └── depthdensifier/     # Main package
-├── pyproject.toml          # Project configuration
-├── README.md
-└── LICENSE
+# Install the project and all dependencies
+uv sync
 ```
 
-### Verification
+## Dependencies
 
-After installation, verify everything works:
+**Core Libraries:**
+- PyTorch with CUDA support (CUDA 12.8)
+- PyColmap for COLMAP integration
+- NumPy, SciPy for numerical computing
+- Pillow for image processing
 
-```python
-import depthdensifier
-print(f"DepthDensifier version: {depthdensifier.__version__}")
+**3D Processing:**
+- MoGe (Microsoft Monocular Geometry) - installed from GitHub
+- Matplotlib, Plotly for visualization
 
-# Test MoGe integration
-import moge
-print("MoGe successfully imported!")
-```
+**Pipeline Tools:**
+- Tyro for CLI configuration
+- Hugging Face Hub for model downloads
+- Numba for JIT compilation
+- Scikit-learn for utilities
 
 ## Getting Test Data
 
-To download test datasets and set up the data directory structure, use one of the provided scripts:
+Download test datasets and MoGe models:
 
-### Python Script (Recommended)
 ```bash
 # Download datasets and all MoGe models (default)
 uv run python downloads.py
 
-# Download only datasets, skip models
-uv run python downloads.py --config.no-download-moge-models
-
-# Download only recommended MoGe model
+# Download only recommended model (moge-2-vitl-normal)
 uv run python downloads.py --config.moge-models recommended
 
-# Download specific MoGe models
-uv run python downloads.py --config.moge-models "moge-2-vitl,moge-2-vitb-normal"
-
-# Download only MoGe v2 models
-uv run python downloads.py --config.moge-models v2
-
-# Custom data directory and options
-uv run python downloads.py --config.data-dir my_data --config.keep-zip --config.skip-existing
+# Custom options
+uv run python downloads.py --config.data-dir my_data --config.skip-existing
 
 # See all options
 uv run python downloads.py --help
 ```
 
-#### Available MoGe Models:
-- **`all`** (default): All available models (5 models, ~10GB total)
-- **`recommended`**: `moge-2-vitl-normal` - Latest ViT-Large with metric scale and normal maps
-- **`v1`**: MoGe-1 models - `moge-vitl` (314M params)
-- **`v2`**: MoGe-2 models - 4 variants with metric scale support
-- **Custom**: Comma-separated model names for specific downloads
-
-### Shell Scripts
-```bash
-# Linux/macOS
-./scripts/download_data.sh
-
-# Windows PowerShell
-.\scripts\download_data.ps1
-
-# Keep zip files after extraction
-.\scripts\download_data.ps1 --keep-zip
-```
-
-The download script intelligently detects existing data and skips downloads when appropriate. It will create the following structure:
-```
-DepthDensifier/
-├── data/            # Test data
-│   ├── 360_v2/      # RefNeRF 360° test dataset
-│   ├── outputs/     # Processing results
-│   └── temp/        # Temporary files
-├── models/          # Pretrained models (downloaded by default)
-│   └── moge/        # MoGe models folder
-│       ├── moge-2-vitl-normal/     # Recommended model (metric + normal)
-│       ├── moge-2-vitl/            # MoGe-2 ViT-Large
-│       ├── moge-2-vitb-normal/     # MoGe-2 ViT-Base
-│       ├── moge-2-vits-normal/     # MoGe-2 ViT-Small
-│       └── moge-vitl/              # MoGe-1 ViT-Large
-└── downloads.py     # Download script (moved to project root)
-```
-
-### Using Downloaded MoGe Models
-
-Once downloaded, you can use the models in your code:
-
-```python
-from moge.model.v2 import MoGeModel
-import torch
-
-# Load the recommended model
-model = MoGeModel.from_pretrained("models/moge/moge-2-vitl-normal")
-
-# Or load any other downloaded model
-model = MoGeModel.from_pretrained("models/moge/moge-2-vitb-normal")
-```
+### Available MoGe Models:
+- **`recommended`**: `moge-2-vitl-normal` - ViT-Large with metric scale and normal maps
+- **`v1`**: MoGe-1 models (relative depth only)
+- **`v2`**: MoGe-2 models with metric scale support (4 variants)
+- **`all`**: All available models (~10GB total)
 
 ## Usage
 
+### Running the Pipeline
+
+Process a single dataset:
+
+```bash
+# Basic usage with default settings
+uv run scripts/run_pipeline_optimized_v2.py
+
+# Custom dataset paths
+uv run scripts/run_pipeline_optimized_v2.py \
+  --paths.recon-path "data/bicycle/sparse/0" \
+  --paths.image-dir "data/bicycle/images" \
+  --paths.output-model-dir "results/bicycle"
+
+# Performance tuning
+uv run scripts/run_pipeline_optimized_v2.py \
+  --processing.batch-size 8 \
+  --processing.downsample-density 16 \
+  --refiner.use-fp16 true \
+  --refiner.skip-smoothing true
+```
+
 ### Batch Processing All Datasets
 
-The project includes scripts to automatically process all datasets in your `data/` directory using the depth densification pipeline.
+Process all datasets in your `data/` directory:
 
-#### PowerShell Script (Windows) - Recommended
+```bash
+# Python script (cross-platform)
+uv run scripts/run_batch_all.py
 
-```powershell
-# Run on all datasets with default settings
+# PowerShell script (Windows)
 .\scripts\run_all_datasets.ps1
-
-# Or specify custom paths
-.\scripts\run_all_datasets.ps1 -DataDir "data" -ResultsDir "results" -Script "scripts/run_pipeline.py"
 ```
 
-#### Python Script (Cross-platform)
+### Configuration Parameters
 
-```bash
-# On Windows
-python scripts/run_batch_all.py
+**Processing Parameters:**
+- `pipeline_downsample_factor`: Image downsampling before processing (1=original)
+- `downsample_density`: Point cloud density control (lower=denser)
+- `batch_size`: GPU batch size for inference
+- `prefetch_batches`: Number of batches to prefetch
 
-# On Linux/Mac
-python3 scripts/run_batch_all.py
-```
+**Refinement Parameters:**
+- `use_fp16`: Enable FP16 for 2x speed
+- `skip_smoothing`: Skip median filtering for maximum speed
+- `adaptive_correspondences`: Reduce correspondences for simple scenes
+- `min_correspondences`: Minimum sparse points required
 
-#### Individual Dataset Processing
+**Filtering Parameters:**
+- `vote_threshold`: Votes needed to remove floaters (default: 5)
+- `depth_threshold`: Depth consistency threshold (default: 0.9)
+- `grazing_angle_threshold`: Angle threshold for filtering
 
-To process a single dataset manually:
+## Dataset Structure
 
-```bash
-python scripts/run_pipeline.py --config.paths.recon-path "data/bicycle/sparse/0" --config.paths.image-dir "data/bicycle/images" --config.paths.output-model-dir "results/bicycle"
-```
-
-### What the Scripts Do
-
-1. **Automatically discover datasets** in the `data/` directory
-2. **Validate each dataset** has required COLMAP files (`cameras.bin`, `images.bin`, `points3D.bin`)
-3. **Process each dataset sequentially** using the depth densification pipeline
-4. **Save results** to separate directories under `results/`
-5. **Provide progress tracking** and error reporting
-
-### Dataset Structure Expected
-
-Each dataset should have this structure:
+Expected COLMAP reconstruction format:
 ```
 data/
 ├── bicycle/
 │   ├── images/          # Original images
-│   ├── sparse/0/        # COLMAP reconstruction
-│   │   ├── cameras.bin
-│   │   ├── images.bin
-│   │   └── points3D.bin
-│   ├── images_2/        # Downsampled (optional)
-│   ├── images_4/        # Downsampled (optional)
-│   └── images_8/        # Downsampled (optional)
+│   └── sparse/0/        # COLMAP reconstruction
+│       ├── cameras.bin
+│       ├── images.bin
+│       └── points3D.bin
 └── bonsai/
     └── ...
 ```
 
-### Output Structure
-
-Results will be saved as:
+Output structure:
 ```
 results/
 ├── bicycle/
-│   └── 0/               # COLMAP model files
-├── bonsai/
-│   └── 0/
-└── ...
+│   └── 0/               # Dense COLMAP model
+└── bonsai/
+    └── 0/
 ```
 
-### Processing Time
+## Performance Tips
 
-Each dataset may take **1-2 hours** to process depending on:
-- Number of images
-- Hardware (GPU vs CPU)
-- Image resolution
-- Processing parameters
+1. **GPU Memory**: Reduce `batch_size` if running out of VRAM
+2. **Speed**: Enable `use_fp16` and `skip_smoothing` for faster processing
+3. **Quality**: Lower `downsample_density` for denser points (but slower)
+4. **Large Datasets**: Increase `gpu_cache_clear_interval` to reduce memory fragmentation
 
-### Error Handling
+## Troubleshooting
 
-The scripts will:
-- Skip datasets missing required files
-- Continue processing other datasets if one fails
-- Provide detailed error messages
-- Generate a summary report at the end
-
-### Configuration
-
-To modify processing parameters, edit the `ProcessingConfig` and `FilteringConfig` classes in `scripts/run_pipeline.py`:
-
-```python
-@dataclass
-class ProcessingConfig:
-    pipeline_downsample_factor: int = 1      # 1 = original resolution, higher = faster
-    downsample_density: int = 32             # Point cloud density (higher = more points)
-
-@dataclass
-class FilteringConfig:
-    vote_threshold: int = 5                  # Multi-view consistency threshold
-    depth_threshold: float = 0.7             # Depth filtering threshold
-```
-
-### Troubleshooting
-
-1. **CUDA not available**: The script will warn but continue with CPU processing (slower)
-2. **Missing dependencies**: Ensure all required packages are installed with `uv sync`
-3. **Timeout**: Large datasets may need more time - the timeout is set to 2 hours per dataset
-4. **Memory issues**: Reduce `pipeline_downsample_factor` or `downsample_density` in the config
-5. **Git LFS issues**: The installation automatically handles LFS download errors by skipping missing files
+- **CUDA not available**: Will fallback to CPU (much slower)
+- **Memory issues**: Reduce batch size or increase downsample density
+- **Git LFS errors**: Installation auto-skips LFS files, core functionality remains intact
+- **Missing dependencies**: Run `uv sync` to ensure all packages are installed
 
 ## License
 
