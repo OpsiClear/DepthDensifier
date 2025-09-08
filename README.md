@@ -170,7 +170,115 @@ model = MoGeModel.from_pretrained("models/moge/moge-2-vitb-normal")
 
 ## Usage
 
-*Coming soon - usage examples and API documentation*
+### Batch Processing All Datasets
+
+The project includes scripts to automatically process all datasets in your `data/` directory using the depth densification pipeline.
+
+#### PowerShell Script (Windows) - Recommended
+
+```powershell
+# Run on all datasets with default settings
+.\scripts\run_all_datasets.ps1
+
+# Or specify custom paths
+.\scripts\run_all_datasets.ps1 -DataDir "data" -ResultsDir "results" -Script "scripts/run_pipeline.py"
+```
+
+#### Python Script (Cross-platform)
+
+```bash
+# On Windows
+python scripts/run_batch_all.py
+
+# On Linux/Mac
+python3 scripts/run_batch_all.py
+```
+
+#### Individual Dataset Processing
+
+To process a single dataset manually:
+
+```bash
+python scripts/run_pipeline.py --config.paths.recon-path "data/bicycle/sparse/0" --config.paths.image-dir "data/bicycle/images" --config.paths.output-model-dir "results/bicycle"
+```
+
+### What the Scripts Do
+
+1. **Automatically discover datasets** in the `data/` directory
+2. **Validate each dataset** has required COLMAP files (`cameras.bin`, `images.bin`, `points3D.bin`)
+3. **Process each dataset sequentially** using the depth densification pipeline
+4. **Save results** to separate directories under `results/`
+5. **Provide progress tracking** and error reporting
+
+### Dataset Structure Expected
+
+Each dataset should have this structure:
+```
+data/
+├── bicycle/
+│   ├── images/          # Original images
+│   ├── sparse/0/        # COLMAP reconstruction
+│   │   ├── cameras.bin
+│   │   ├── images.bin
+│   │   └── points3D.bin
+│   ├── images_2/        # Downsampled (optional)
+│   ├── images_4/        # Downsampled (optional)
+│   └── images_8/        # Downsampled (optional)
+└── bonsai/
+    └── ...
+```
+
+### Output Structure
+
+Results will be saved as:
+```
+results/
+├── bicycle/
+│   └── 0/               # COLMAP model files
+├── bonsai/
+│   └── 0/
+└── ...
+```
+
+### Processing Time
+
+Each dataset may take **1-2 hours** to process depending on:
+- Number of images
+- Hardware (GPU vs CPU)
+- Image resolution
+- Processing parameters
+
+### Error Handling
+
+The scripts will:
+- Skip datasets missing required files
+- Continue processing other datasets if one fails
+- Provide detailed error messages
+- Generate a summary report at the end
+
+### Configuration
+
+To modify processing parameters, edit the `ProcessingConfig` and `FilteringConfig` classes in `scripts/run_pipeline.py`:
+
+```python
+@dataclass
+class ProcessingConfig:
+    pipeline_downsample_factor: int = 1      # 1 = original resolution, higher = faster
+    downsample_density: int = 32             # Point cloud density (higher = more points)
+
+@dataclass
+class FilteringConfig:
+    vote_threshold: int = 5                  # Multi-view consistency threshold
+    depth_threshold: float = 0.7             # Depth filtering threshold
+```
+
+### Troubleshooting
+
+1. **CUDA not available**: The script will warn but continue with CPU processing (slower)
+2. **Missing dependencies**: Ensure all required packages are installed with `uv sync`
+3. **Timeout**: Large datasets may need more time - the timeout is set to 2 hours per dataset
+4. **Memory issues**: Reduce `pipeline_downsample_factor` or `downsample_density` in the config
+5. **Git LFS issues**: The installation automatically handles LFS download errors by skipping missing files
 
 ## License
 

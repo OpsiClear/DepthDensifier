@@ -34,7 +34,7 @@ torch = [
 torchvision = [
   {index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'"},
 ]
-moge = { git = "https://github.com/microsoft/MoGe.git", subdirectory = "." }
+moge = { git = "https://github.com/microsoft/MoGe.git", subdirectory = ".", rev = "main" }
 
 [[tool.uv.index]]
 explicit = true
