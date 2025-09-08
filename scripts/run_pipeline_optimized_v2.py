@@ -359,10 +359,8 @@ def main(config: ScriptConfig):
     
     for image in image_list:
         camera = rec.cameras[image.camera_id]
-        # Create a copy and rescale for processing resolution
-        camera_copy = pycolmap.Camera(camera)
         
-        # We'll compute matrices for multiple resolutions as needed
+        # Pre-compute matrices for optimization
         cam_center = image.projection_center()
         cam_from_world = image.cam_from_world().matrix()
         
