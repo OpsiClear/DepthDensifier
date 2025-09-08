@@ -4,7 +4,6 @@ Utility functions for DepthDensifier.
 
 from pathlib import Path
 import pycolmap
-import numpy as np
 
 
 def load_colmap_model(model_path: str | Path) -> pycolmap.Reconstruction:

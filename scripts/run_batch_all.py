@@ -9,15 +9,15 @@ from typing import List
 import logging
 from dataclasses import dataclass, field
 import tyro
-from run_pipeline import (
+from run_pipeline_optimized_v2 import (
     main as run_pipeline_main, 
     ScriptConfig, 
     PathsConfig, 
     MoGeConfig,
-    ProcessingConfig, 
-    FilteringConfig
+    ProcessingConfig
 )
 from depthdensifier.depth_refiner import RefinerConfig
+from depthdensifier.floater_filter import FloaterFilterConfig
 
 # Set up logging
 logging.basicConfig(
@@ -42,7 +42,7 @@ class BatchConfig:
     """Processing parameters like downsampling."""
     
     # Filtering configuration  
-    filtering: FilteringConfig = field(default_factory=FilteringConfig)
+    filtering: FloaterFilterConfig = field(default_factory=FloaterFilterConfig)
     """Multi-view consistency filtering parameters."""
     
     # Refiner configuration
@@ -91,7 +91,7 @@ def run_densification_for_dataset(dataset_name: str, batch_config: BatchConfig) 
     # Set up paths
     recon_path = batch_config.data_dir / dataset_name / "sparse" / "0"
     image_dir = batch_config.data_dir / dataset_name / "images"
-    output_dir = batch_config.results_dir / dataset_name
+    output_dir = batch_config.results_dir / dataset_name / "sparse" / "0"
 
     # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -114,7 +114,7 @@ def run_densification_for_dataset(dataset_name: str, batch_config: BatchConfig) 
         logger.info(f"  Reconstruction: {recon_path}")
         logger.info(f"  Images: {image_dir}")
         logger.info(f"  Output: {output_dir}")
-        logger.info(f"  Processing config: downsample_factor={config.processing.pipeline_downsample_factor}, density={config.processing.downsample_density}")
+        logger.info(f"  Processing config: downsample_factor={config.processing.pipeline_downsample_factor}, density={config.processing.downsample_density}, batch_size={config.processing.batch_size}")
         logger.info(f"  Filtering config: vote_threshold={config.filtering.vote_threshold}, depth_threshold={config.filtering.depth_threshold}, grazing_angle={config.filtering.grazing_angle_threshold}")
 
         # Run the pipeline directly
@@ -138,7 +138,7 @@ def main(config: BatchConfig):
     logger.info(f"Data directory: {config.data_dir.absolute()}")
     logger.info(f"Results directory: {config.results_dir.absolute()}")
     logger.info("Configuration:")
-    logger.info(f"  Processing: downsample_factor={config.processing.pipeline_downsample_factor}, density={config.processing.downsample_density}")
+    logger.info(f"  Processing: downsample_factor={config.processing.pipeline_downsample_factor}, density={config.processing.downsample_density}, batch_size={config.processing.batch_size}")
     logger.info(f"  Filtering: vote_threshold={config.filtering.vote_threshold}, depth_threshold={config.filtering.depth_threshold}, grazing_angle={config.filtering.grazing_angle_threshold}")
     logger.info(f"  MoGe model: {config.moge.checkpoint}")
 
