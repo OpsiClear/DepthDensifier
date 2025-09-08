@@ -15,7 +15,6 @@ The DepthDensifier pipeline employs a multi-stage approach to transform sparse C
    - Aligns MoGe depth predictions with COLMAP's sparse 3D points
    - Uses GPU-accelerated PCHIP (Piecewise Cubic Hermite Interpolating Polynomial) for monotonic depth correction
    - Preserves depth ordering while maintaining local consistency
-   - Optional FP16 processing for 2x speedup on modern GPUs
 
 ### 3. **Dense Point Cloud Generation**
    - Unprojects refined depth maps to 3D space
@@ -23,22 +22,16 @@ The DepthDensifier pipeline employs a multi-stage approach to transform sparse C
    - Configurable density control via downsampling parameters
 
 ### 4. **Multi-View Consistency Filtering**
-   - Projects points across multiple views to detect "floaters" (inconsistent points)
-   - Uses voting mechanism to identify and remove geometric inconsistencies
    - Filters based on depth consistency and grazing angle thresholds
-
-### 5. **Optimizations**
-   - **Batch Processing**: Processes multiple images simultaneously on GPU
-   - **Async I/O**: Prefetches images while GPU processes current batch
-   - **Memory Management**: Pre-allocates arrays and clears GPU cache periodically
-   - **Vectorized Operations**: Uses NumPy/PyTorch vectorization throughout
+   - Projects points across multiple views to detect floaters
+   - Uses voting mechanism to identify and remove floaters
 
 ## Installation
 
 ### Prerequisites
 
 - Python 3.12+
-- CUDA-compatible GPU (recommended for PyTorch acceleration)
+- CUDA-compatible GPU
 - Git with Git LFS support
 
 ### Install with uv
@@ -51,52 +44,15 @@ Once uv is installed:
 # Clone the repository
 git clone <your-repo-url>
 cd DepthDensifier
-
-# Install the project and all dependencies
 uv sync
 ```
-
-## Dependencies
-
-**Core Libraries:**
-- PyTorch with CUDA support (CUDA 12.8)
-- PyColmap for COLMAP integration
-- NumPy, SciPy for numerical computing
-- Pillow for image processing
-
-**3D Processing:**
-- MoGe (Microsoft Monocular Geometry) - installed from GitHub
-- Matplotlib, Plotly for visualization
-
-**Pipeline Tools:**
-- Tyro for CLI configuration
-- Hugging Face Hub for model downloads
-- Numba for JIT compilation
-- Scikit-learn for utilities
-
-## Getting Test Data
 
 Download test datasets and MoGe models:
 
 ```bash
 # Download datasets and all MoGe models (default)
-uv run python downloads.py
-
-# Download only recommended model (moge-2-vitl-normal)
-uv run python downloads.py --config.moge-models recommended
-
-# Custom options
-uv run python downloads.py --config.data-dir my_data --config.skip-existing
-
-# See all options
-uv run python downloads.py --help
+uv run downloads.py
 ```
-
-### Available MoGe Models:
-- **`recommended`**: `moge-2-vitl-normal` - ViT-Large with metric scale and normal maps
-- **`v1`**: MoGe-1 models (relative depth only)
-- **`v2`**: MoGe-2 models with metric scale support (4 variants)
-- **`all`**: All available models (~10GB total)
 
 ## Usage
 
@@ -129,9 +85,6 @@ Process all datasets in your `data/` directory:
 ```bash
 # Python script (cross-platform)
 uv run scripts/run_batch_all.py
-
-# PowerShell script (Windows)
-.\scripts\run_all_datasets.ps1
 ```
 
 ### Configuration Parameters
@@ -176,21 +129,3 @@ results/
 └── bonsai/
     └── 0/
 ```
-
-## Performance Tips
-
-1. **GPU Memory**: Reduce `batch_size` if running out of VRAM
-2. **Speed**: Enable `use_fp16` and `skip_smoothing` for faster processing
-3. **Quality**: Lower `downsample_density` for denser points (but slower)
-4. **Large Datasets**: Increase `gpu_cache_clear_interval` to reduce memory fragmentation
-
-## Troubleshooting
-
-- **CUDA not available**: Will fallback to CPU (much slower)
-- **Memory issues**: Reduce batch size or increase downsample density
-- **Git LFS errors**: Installation auto-skips LFS files, core functionality remains intact
-- **Missing dependencies**: Run `uv sync` to ensure all packages are installed
-
-## License
-
-This project is licensed under the terms specified in the LICENSE file.
