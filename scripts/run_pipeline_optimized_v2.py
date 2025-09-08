@@ -10,13 +10,13 @@ from dataclasses import dataclass, field
 import tyro
 import dataclasses
 import logging
-from typing import List, Dict, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from queue import Queue
 
-# Import the refiner from your source directory
+# Import the refiner and floater filter from your source directory
 from depthdensifier.depth_refiner import DepthRefiner, RefinerConfig
+from depthdensifier.floater_filter import FloaterFilter, FloaterFilterConfig
 
 # Set up logging
 logging.basicConfig(
@@ -65,16 +65,7 @@ class ProcessingConfig:
     """Number of threads for async I/O operations."""
 
 
-@dataclass
-class FilteringConfig:
-    """Parameters for multi-view consistency filtering."""
-
-    vote_threshold: int = 5
-    """Number of votes required to remove a 'floater' point."""
-    depth_threshold: float = 0.9
-    """Threshold to identify a floater (projected_depth < T * refined_depth)."""
-    grazing_angle_threshold: float = 0.052
-    """Threshold for grazing angle filtering (cos of angle, ~87 degrees)."""
+# Use FloaterFilterConfig from the module instead of legacy config
 
 
 @dataclass
@@ -85,7 +76,7 @@ class ScriptConfig:
     moge: MoGeConfig = field(default_factory=MoGeConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     refiner: RefinerConfig = field(default_factory=RefinerConfig)
-    filtering: FilteringConfig = field(default_factory=FilteringConfig)
+    filtering: FloaterFilterConfig = field(default_factory=FloaterFilterConfig)
 
 
 def project_points(
@@ -121,49 +112,55 @@ def unproject_points(points2D, depth, camera: pycolmap.Camera):
     return points3D_camera
 
 
-def load_image_sync(image_path: Path, new_w: int, new_h: int) -> Tuple[torch.Tensor, Image.Image]:
+def load_image_sync(
+    image_path: Path, new_w: int, new_h: int
+) -> tuple[torch.Tensor, Image.Image]:
     """Synchronous image loading and preprocessing."""
     pil_image = Image.open(image_path).convert("RGB")
-    pil_image_rescaled = pil_image.resize(
-        (new_w, new_h), 
-        Image.Resampling.BILINEAR
-    )
-    
+    pil_image_rescaled = pil_image.resize((new_w, new_h), Image.Resampling.BILINEAR)
+
     # Direct tensor creation
     img_tensor = torch.from_numpy(np.array(pil_image_rescaled)).float() / 255.0
     img_tensor = img_tensor.permute(2, 0, 1)
-    
+
     return img_tensor, pil_image_rescaled
 
 
 class AsyncImageLoader:
     """Async image loader with prefetching capabilities."""
-    
+
     def __init__(self, num_threads: int = 4, prefetch_size: int = 8):
         self.executor = ThreadPoolExecutor(max_workers=num_threads)
         self.prefetch_queue: Queue = Queue(maxsize=prefetch_size)
         self.prefetch_thread = None
         self.stop_prefetching = threading.Event()
-        
-    def start_prefetching(self, image_batches: List[List[Tuple[pycolmap.Image, Path]]], 
-                         new_w: int, new_h: int):
+
+    def start_prefetching(
+        self,
+        image_batches: list[list[tuple[pycolmap.Image, Path]]],
+        new_w: int,
+        new_h: int,
+    ):
         """Start prefetching images in background thread."""
+
         def prefetch_worker():
             for batch_idx, batch_data in enumerate(image_batches):
                 if self.stop_prefetching.is_set():
                     break
-                    
+
                 # Load batch of images
                 futures = []
                 for image, image_path in batch_data:
-                    future = self.executor.submit(load_image_sync, image_path, new_w, new_h)
+                    future = self.executor.submit(
+                        load_image_sync, image_path, new_w, new_h
+                    )
                     futures.append((image, future))
-                
+
                 # Collect results
                 batch_tensors = []
                 batch_pil_images = []
                 batch_images = []
-                
+
                 for image, future in futures:
                     try:
                         img_tensor, pil_image_rescaled = future.result()
@@ -173,26 +170,26 @@ class AsyncImageLoader:
                     except Exception as e:
                         logger.warning(f"Failed to load image {image.name}: {e}")
                         continue
-                
+
                 if batch_tensors:
                     batch_result = {
-                        'batch_idx': batch_idx,
-                        'batch_images': batch_images,
-                        'batch_tensors': torch.stack(batch_tensors),
-                        'batch_pil_images': batch_pil_images
+                        "batch_idx": batch_idx,
+                        "batch_images": batch_images,
+                        "batch_tensors": torch.stack(batch_tensors),
+                        "batch_pil_images": batch_pil_images,
                     }
                     self.prefetch_queue.put(batch_result)
-                    
+
         self.prefetch_thread = threading.Thread(target=prefetch_worker)
         self.prefetch_thread.start()
-    
-    def get_batch(self, timeout: float = 30.0) -> Optional[Dict]:
+
+    def get_batch(self, timeout: float = 30.0) -> dict | None:
         """Get next prefetched batch."""
         try:
             return self.prefetch_queue.get(timeout=timeout)
         except Exception:
             return None
-    
+
     def stop(self):
         """Stop prefetching and cleanup."""
         self.stop_prefetching.set()
@@ -202,95 +199,130 @@ class AsyncImageLoader:
 
 
 def process_batch(
-    batch_images: List[pycolmap.Image],
+    batch_images: list[pycolmap.Image],
     batch_tensors: torch.Tensor,
     model: MoGeModel,
     rec: pycolmap.Reconstruction,
     config: ScriptConfig,
     refiner: DepthRefiner,
     device: torch.device,
-    sparse_points_cache: Dict[int, np.ndarray]
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], Dict]:
+    sparse_points_cache: dict[int, np.ndarray],
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], dict]:
     """Process a batch of images through MoGe and refinement."""
-    
+
     # Run batch inference
     with torch.no_grad():
         batch_outputs = model.infer(batch_tensors)
-    
+
     batch_dense_points = []
     batch_dense_colors = []
     batch_dense_normals = []
     cached_data = {}
-    
+
     # Process each image in the batch
     for idx, image in enumerate(batch_images):
         # Extract outputs for this image
         moge_depth = batch_outputs["depth"][idx].cpu().numpy()
         moge_normal = batch_outputs["normal"][idx].cpu().numpy()
         moge_mask = batch_outputs["mask"][idx].cpu().numpy()
-        
+
         # Get cached sparse points for refinement
         if image.image_id not in sparse_points_cache:
             continue  # Skip images with no sparse points
-        
+
         points3D_world = sparse_points_cache[image.image_id]
-        
+
         # Setup camera at processing resolution
         camera = rec.cameras[image.camera_id]
         h, w = moge_depth.shape
         camera.rescale(new_width=w, new_height=h)
-        
-        # Refine depth
+
+        # Handle sky regions BEFORE refinement to prevent inf corruption
+        # Identify sky pixels (MoGe sets them to inf)
+        sky_mask = np.isinf(moge_depth) | (moge_depth > 1000)
+
+        # Create a copy of depth for refinement, replacing inf with large finite values
+        depth_for_refinement = moge_depth.copy()
+        if np.any(sky_mask):
+            # Use a large but finite placeholder for sky during refinement
+            # This prevents inf from corrupting the interpolation
+            temp_sky_depth = 1000.0  # Large but finite
+            depth_for_refinement[sky_mask] = temp_sky_depth
+
+            if config.refiner.verbose > 1:
+                sky_pixel_count = np.sum(sky_mask)
+                logger.debug(
+                    f"  - Pre-refinement: {sky_pixel_count} sky pixels temporarily set to {temp_sky_depth}"
+                )
+
+        # Refine depth with finite values only
         cam_from_world_mat = image.cam_from_world().matrix()[:3, :]
         K_mat = camera.calibration_matrix()
         refinement_results = refiner.refine_depth(
-            depth_map=moge_depth,
+            depth_map=depth_for_refinement,
             normal_map=moge_normal,
             points3D=points3D_world,
             cam_from_world=cam_from_world_mat,
             K=K_mat,
             mask=moge_mask,
         )
-        
+
         refined_depth = refinement_results["refined_depth"]
+
+        # Now properly handle sky regions with 2x max depth
+        # Calculate maximum valid (non-sky) depth in the view
+        valid_depth_mask = moge_mask & ~sky_mask & (refined_depth > 0)
+        if np.any(valid_depth_mask) and np.any(sky_mask):
+            max_valid_depth = np.max(refined_depth[valid_depth_mask])
+            sky_depth_value = 2.0 * max_valid_depth
+
+            # Apply final sky depth (2x max of valid depths)
+            refined_depth[sky_mask] = sky_depth_value
+
+            if config.refiner.verbose > 1:
+                logger.debug(
+                    f"  - Post-refinement: Sky pixels set to {sky_depth_value:.2f} (2x max depth {max_valid_depth:.2f})"
+                )
+
+        # Set invalid regions to 0
         refined_depth[~moge_mask] = 0
-        
+
         # Cache for filtering
         cached_data[image.image_id] = {
             "refined_depth": refined_depth,
             "camera": camera,
             "image": image,
         }
-        
+
         # Densify using vectorized operations
         pixels_y, pixels_x = np.mgrid[
             0 : h : config.processing.downsample_density,
             0 : w : config.processing.downsample_density,
         ]
-        
+
         valid_pixels = refined_depth[pixels_y, pixels_x] > 0
         if not np.any(valid_pixels):
             continue
-            
+
         pixels_x_valid, pixels_y_valid = pixels_x[valid_pixels], pixels_y[valid_pixels]
-        
+
         # Get colors and normals
         # Note: we need the original image tensor to get colors
         img_tensor_cpu = batch_tensors[idx].cpu().permute(1, 2, 0).numpy()
         img_np = (img_tensor_cpu * 255).astype(np.uint8)
         colors = img_np[pixels_y_valid, pixels_x_valid]
         normals = moge_normal[pixels_y_valid, pixels_x_valid]
-        
+
         # Unproject to 3D
         depth_values = refined_depth[pixels_y_valid, pixels_x_valid]
         points2D = np.stack([pixels_x_valid, pixels_y_valid], axis=-1)
         points3D_camera = unproject_points(points2D, depth_values, camera)
         points3D_world = image.cam_from_world().inverse() * points3D_camera
-        
+
         batch_dense_points.append(points3D_world)
         batch_dense_colors.append(colors)
         batch_dense_normals.append(normals)
-    
+
     return batch_dense_points, batch_dense_colors, batch_dense_normals, cached_data
 
 
@@ -334,10 +366,14 @@ def main(config: ScriptConfig):
     step_start_time = time.time()
     logger.info("Pre-computing sparse points cache...")
     image_list = [img for img in rec.images.values() if img.has_pose]
-    
-    sparse_points_cache: Dict[int, np.ndarray] = {}
-    cache_stats = {"total_images": len(image_list), "cached_images": 0, "total_sparse_points": 0}
-    
+
+    sparse_points_cache: dict[int, np.ndarray] = {}
+    cache_stats = {
+        "total_images": len(image_list),
+        "cached_images": 0,
+        "total_sparse_points": 0,
+    }
+
     for image in image_list:
         point3D_ids = [p.point3D_id for p in image.points2D if p.has_point3D()]
         if len(point3D_ids) > 0:
@@ -345,77 +381,85 @@ def main(config: ScriptConfig):
             sparse_points_cache[image.image_id] = points3D_world
             cache_stats["cached_images"] += 1
             cache_stats["total_sparse_points"] += len(points3D_world)
-    
+
     logger.info(
         f"-> Sparse points cache created: {cache_stats['cached_images']}/{cache_stats['total_images']} "
         f"images cached with {cache_stats['total_sparse_points']} total sparse points "
         f"in {time.time() - step_start_time:.2f}s."
     )
-    
+
     # --- Pre-compute camera matrices for filtering optimization ---
     step_start_time = time.time()
     logger.info("Pre-computing camera matrices...")
-    camera_matrices_cache: Dict[int, Dict] = {}
-    
+    camera_matrices_cache: dict[int, dict] = {}
+
     for image in image_list:
         camera = rec.cameras[image.camera_id]
-        
+
         # Pre-compute matrices for optimization
         cam_center = image.projection_center()
         cam_from_world = image.cam_from_world().matrix()
-        
+
         camera_matrices_cache[image.image_id] = {
             "original_camera": camera,
             "cam_center": cam_center,
             "cam_from_world": cam_from_world,
-            "image": image
+            "image": image,
         }
-    
+
     logger.info(
         f"-> Camera matrices cached for {len(camera_matrices_cache)} images "
         f"in {time.time() - step_start_time:.2f}s."
     )
-    
+
     # --- 5. Pre-allocate arrays for better performance ---
     # Estimate total points (with 50% overhead)
     sample_image = Image.open(config.paths.image_dir / image_list[0].name)
     w_orig, h_orig = sample_image.size
     new_w = w_orig // config.processing.pipeline_downsample_factor
     new_h = h_orig // config.processing.pipeline_downsample_factor
-    points_per_image = (new_h // config.processing.downsample_density) * (new_w // config.processing.downsample_density)
+    points_per_image = (new_h // config.processing.downsample_density) * (
+        new_w // config.processing.downsample_density
+    )
     estimated_total_points = int(points_per_image * len(image_list) * 1.5)
-    
-    logger.info(f"Pre-allocating arrays for approximately {estimated_total_points} points...")
+
+    logger.info(
+        f"Pre-allocating arrays for approximately {estimated_total_points} points..."
+    )
     all_dense_points = np.zeros((estimated_total_points, 3), dtype=np.float32)
     all_dense_colors = np.zeros((estimated_total_points, 3), dtype=np.uint8)
     all_dense_normals = np.zeros((estimated_total_points, 3), dtype=np.float32)
     point_idx = 0
-    
+
     # --- 6. Setup async image loading with prefetching ---
     processing_start_time = time.time()
     cached_refinement_data = {}
     batch_size = config.processing.batch_size
-    
+
     # Prepare batch data for async loading
     image_batches = []
     for batch_start in range(0, len(image_list), batch_size):
         batch_end = min(batch_start + batch_size, len(image_list))
         batch_images = image_list[batch_start:batch_end]
-        batch_data = [(image, config.paths.image_dir / image.name) for image in batch_images]
+        batch_data = [
+            (image, config.paths.image_dir / image.name) for image in batch_images
+        ]
         image_batches.append(batch_data)
-    
+
     # Initialize async loader
     async_loader = AsyncImageLoader(
         num_threads=config.processing.io_threads,
-        prefetch_size=config.processing.prefetch_batches
+        prefetch_size=config.processing.prefetch_batches,
     )
-    
-    logger.info(f"Starting async image loading with {config.processing.io_threads} threads, "
-               f"prefetching {config.processing.prefetch_batches} batches ahead...")
-    
+
+    logger.info(
+        f"Starting async image loading with {config.processing.io_threads} threads, "
+        f"prefetching {config.processing.prefetch_batches} batches ahead..."
+    )
+
     # Start prefetching
     async_loader.start_prefetching(image_batches, new_w, new_h)
-    
+
     # --- 7. Process images with async I/O ---
     try:
         for batch_idx in tqdm(range(len(image_batches)), desc="Processing batches"):
@@ -424,17 +468,26 @@ def main(config: ScriptConfig):
             if batch_data is None:
                 logger.warning(f"Failed to get batch {batch_idx}, skipping...")
                 continue
-            
-            batch_images = batch_data['batch_images']
-            batch_tensor = batch_data['batch_tensors'].to(device)
-            
+
+            batch_images = batch_data["batch_images"]
+            batch_tensor = batch_data["batch_tensors"].to(device)
+
             # Process batch
             batch_points, batch_colors, batch_normals, batch_cached = process_batch(
-                batch_images, batch_tensor, model, rec, config, refiner, device, sparse_points_cache
+                batch_images,
+                batch_tensor,
+                model,
+                rec,
+                config,
+                refiner,
+                device,
+                sparse_points_cache,
             )
-            
+
             # Store results in pre-allocated arrays
-            for points, colors, normals in zip(batch_points, batch_colors, batch_normals):
+            for points, colors, normals in zip(
+                batch_points, batch_colors, batch_normals
+            ):
                 n_points = len(points)
                 if point_idx + n_points > len(all_dense_points):
                     # Resize if needed
@@ -443,129 +496,66 @@ def main(config: ScriptConfig):
                     all_dense_points = np.resize(all_dense_points, (new_size, 3))
                     all_dense_colors = np.resize(all_dense_colors, (new_size, 3))
                     all_dense_normals = np.resize(all_dense_normals, (new_size, 3))
-                
-                all_dense_points[point_idx:point_idx + n_points] = points
-                all_dense_colors[point_idx:point_idx + n_points] = colors
-                all_dense_normals[point_idx:point_idx + n_points] = normals
+
+                all_dense_points[point_idx : point_idx + n_points] = points
+                all_dense_colors[point_idx : point_idx + n_points] = colors
+                all_dense_normals[point_idx : point_idx + n_points] = normals
                 point_idx += n_points
-            
+
             cached_refinement_data.update(batch_cached)
-            
+
             # Clear GPU cache periodically
             if batch_idx % config.processing.gpu_cache_clear_interval == 0:
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-            
+
             logger.info(f"Processed batch {batch_idx + 1}, total points: {point_idx}")
-    
+
     finally:
         # Cleanup async loader
         async_loader.stop()
         logger.info("Async image loader stopped.")
-    
+
     # Trim arrays to actual size
     final_point_cloud = all_dense_points[:point_idx]
     final_colors = all_dense_colors[:point_idx]
     final_normals = all_dense_normals[:point_idx]
-    
+
     logger.info(
         f"-> Image processing finished in {time.time() - processing_start_time:.2f}s."
     )
 
-    # --- 6. Optimized filtering with pre-computed matrices ---
+    # --- 6. Optimized filtering with FloaterFilter module ---
     if point_idx > 0:
         logger.info("--- Filtering point cloud for geometric consistency ---")
         filter_start_time = time.time()
-        
-        # Use pre-computed camera matrices for filtering
-        camera_data = []
-        for data in cached_refinement_data.values():
-            image_id = data["image"].image_id
-            cached_matrices = camera_matrices_cache[image_id]
-            
-            # Create rescaled camera for filtering resolution
-            camera_rescaled = pycolmap.Camera(cached_matrices["original_camera"])
-            refined_depth = data["refined_depth"]
-            h, w = refined_depth.shape
-            camera_rescaled.rescale(new_width=w, new_height=h)
-            
-            camera_data.append({
-                "refined_depth": refined_depth,
-                "camera": camera_rescaled,
-                "image": data["image"],
-                "cam_center": cached_matrices["cam_center"],
-                "cam_from_world": cached_matrices["cam_from_world"],
-                "K": camera_rescaled.calibration_matrix()
-            })
-        
-        floater_votes = np.zeros(point_idx, dtype=np.int32)
-        
-        for data in tqdm(camera_data, desc="Filtering Points"):
-            refined_depth = data["refined_depth"]
-            h, w = refined_depth.shape
-            
-            # Vectorized projection
-            points2d, depths = project_points(
-                final_point_cloud, data["image"], data["camera"]
-            )
-            
-            # Vectorized grazing angle check
-            viewing_dirs = final_point_cloud - data["cam_center"]
-            viewing_norms = np.linalg.norm(viewing_dirs, axis=1)
-            viewing_dirs = viewing_dirs / viewing_norms[:, np.newaxis]
-            
-            dot_products = np.einsum('ij,ij->i', final_normals, -viewing_dirs)
-            not_grazing_mask = dot_products > config.filtering.grazing_angle_threshold
-            
-            u, v = points2d[:, 0], points2d[:, 1]
-            
-            # Vectorized bounds check
-            mask_in_bounds = (
-                (u >= 0) & (u < w) & 
-                (v >= 0) & (v < h) & 
-                (depths > 0) & not_grazing_mask
-            )
-            
-            if not np.any(mask_in_bounds):
-                continue
-            
-            # Vectorized depth lookup
-            u_valid = u[mask_in_bounds].astype(np.int32)
-            v_valid = v[mask_in_bounds].astype(np.int32)
-            
-            projected_depths_valid = depths[mask_in_bounds]
-            refined_depths_at_projections = refined_depth[v_valid, u_valid]
-            
-            valid_lookup_mask = refined_depths_at_projections > 0
-            
-            # Vectorized inconsistency check
-            inconsistent_mask = (
-                projected_depths_valid[valid_lookup_mask] < 
-                config.filtering.depth_threshold * refined_depths_at_projections[valid_lookup_mask]
-            )
-            
-            # Update votes
-            original_indices_in_bounds = np.where(mask_in_bounds)[0]
-            indices_with_valid_lookup = original_indices_in_bounds[valid_lookup_mask]
-            inconsistent_indices = indices_with_valid_lookup[inconsistent_mask]
-            
-            floater_votes[inconsistent_indices] += 1
-        
-        # Apply filtering
-        points_to_keep_mask = floater_votes < config.filtering.vote_threshold
+
+        # Initialize floater filter with FloaterFilterConfig
+        floater_filter = FloaterFilter(config.filtering)
+
+        # Prepare camera data using the filter's helper method
+        camera_data = floater_filter.prepare_camera_data(
+            cached_refinement_data, camera_matrices_cache
+        )
+
+        # Filter points using the module
+        points_to_keep_mask, num_removed = floater_filter.filter_points(
+            final_point_cloud, final_normals, camera_data, show_progress=True
+        )
+
+        # Apply the filtering mask
         final_point_cloud = final_point_cloud[points_to_keep_mask]
         final_colors = final_colors[points_to_keep_mask]
-        num_removed = np.sum(~points_to_keep_mask)
-        
+
         logger.info(
             f"-> Filtering removed {num_removed} points ({num_removed / point_idx * 100:.2f}%)"
         )
         logger.info(f"-> Filtering finished in {time.time() - filter_start_time:.2f}s.")
-        
+
         # --- 7. Vectorized point addition to reconstruction ---
         step_start_time = time.time()
         logger.info(f"Adding {len(final_point_cloud)} new dense points...")
-        
+
         # Batch add points (more efficient than individual adds)
         for i in range(0, len(final_point_cloud), 1000):
             batch_end = min(i + 1000, len(final_point_cloud))
@@ -573,11 +563,11 @@ def main(config: ScriptConfig):
                 rec.add_point3D(
                     xyz=final_point_cloud[j],
                     track=pycolmap.Track(),
-                    color=final_colors[j]
+                    color=final_colors[j],
                 )
-        
+
         logger.info(f"-> New points added in {time.time() - step_start_time:.2f}s.")
-        
+
         # Save the model
         step_start_time = time.time()
         config.paths.output_model_dir.mkdir(parents=True, exist_ok=True)
