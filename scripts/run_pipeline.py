@@ -49,7 +49,7 @@ class ProcessingConfig:
 
     pipeline_downsample_factor: int = 1
     """Factor to downsample images before processing. Larger is faster."""
-    downsample_density: int = 32
+    downsample_density: int = 8
     """Controls final point cloud density (1=densest)."""
 
 
@@ -63,6 +63,10 @@ class FilteringConfig:
     """Threshold to identify a floater (projected_depth < T * refined_depth)."""
     grazing_angle_threshold: float = 0.052
     """Threshold for grazing angle filtering (cos of angle, ~87 degrees)."""
+    enable_downsampling: bool = True
+    """Enable downsampling of the final point cloud if it's too large."""
+    max_points: int = 500_000
+    """Maximum number of points in the final cloud after downsampling."""
 
 
 @dataclass
@@ -312,6 +316,25 @@ def main(config: ScriptConfig):
     cached_refinement_data = {}
     num_points = 0
     image_list = [img for img in rec.images.values() if img.has_pose]
+
+    # --- Filter images based on camera ID (003 and 008) ---
+    original_image_count = len(image_list)
+    filtered_images = []
+    for img in image_list:
+        name_stem = Path(img.name).stem
+        parts = name_stem.split("-")
+        if len(parts) == 2 and parts[1] in ["003", "008"]:
+            filtered_images.append(img)
+
+    image_list = filtered_images
+    logger.info(
+        f"Filtered images: Kept {len(image_list)} out of {original_image_count} "
+        "based on camera ID (003 or 008)."
+    )
+    if not image_list:
+        logger.warning("No images left after filtering. Exiting.")
+        return
+
     for image in tqdm(image_list, desc="Refining and Densifying"):
         per_image_start_time = time.time()
 
@@ -493,9 +516,33 @@ def main(config: ScriptConfig):
 
         logger.info(f"-> Filtering finished in {time.time() - filter_start_time:.2f}s.")
 
-        # --- Update the reconstruction object and save as COLMAP model ---
-        step_start_time = time.time()
+        # --- Downsample point cloud if it's too large ---
+        if (
+            config.filtering.enable_downsampling
+            and len(final_point_cloud) > config.filtering.max_points
+        ):
+            logger.info(
+                f"Point cloud has {len(final_point_cloud)} points. "
+                f"Randomly downsampling to {config.filtering.max_points}..."
+            )
+            downsample_start_time = time.time()
 
+            # Perform a simple and fast random sample using NumPy
+            num_points = config.filtering.max_points
+            indices = np.random.choice(
+                len(final_point_cloud), num_points, replace=False
+            )
+
+            final_point_cloud = final_point_cloud[indices]
+            final_colors = final_colors[indices]
+            final_normals = final_normals[indices]
+
+            logger.info(
+                f"Randomly downsampled to {len(final_point_cloud)} points in "
+                f"{time.time() - downsample_start_time:.2f}s."
+            )
+
+        # --- Update the reconstruction object and save as COLMAP model ---
         step_start_time = time.time()
         logger.info(f"Adding {len(final_point_cloud)} new dense points...")
         for i in range(len(final_point_cloud)):
