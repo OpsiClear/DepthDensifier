@@ -11,8 +11,9 @@ import tyro
 import dataclasses
 import logging
 
-# Import the refiner from your source directory
+# Import the refiner and floater filter from your source directory
 from depthdensifier.depth_refiner import DepthRefiner, RefinerConfig
+from depthdensifier.floater_filter import FloaterFilter, FloaterFilterConfig
 
 # Set up logging
 logging.basicConfig(
@@ -49,20 +50,14 @@ class ProcessingConfig:
 
     pipeline_downsample_factor: int = 1
     """Factor to downsample images before processing. Larger is faster."""
-    downsample_density: int = 8
+    downsample_density: int = 32
     """Controls final point cloud density (1=densest)."""
 
 
 @dataclass
-class FilteringConfig:
-    """Parameters for multi-view consistency filtering."""
+class PostProcessingConfig:
+    """Parameters for post-processing."""
 
-    vote_threshold: int = 5
-    """Number of votes required to remove a 'floater' point."""
-    depth_threshold: float = 0.7
-    """Threshold to identify a floater (projected_depth < T * refined_depth)."""
-    grazing_angle_threshold: float = 0.052
-    """Threshold for grazing angle filtering (cos of angle, ~87 degrees)."""
     enable_downsampling: bool = True
     """Enable downsampling of the final point cloud if it's too large."""
     max_points: int = 500_000
@@ -77,178 +72,8 @@ class ScriptConfig:
     moge: MoGeConfig = field(default_factory=MoGeConfig)
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     refiner: RefinerConfig = field(default_factory=RefinerConfig)
-    filtering: FilteringConfig = field(default_factory=FilteringConfig)
-
-
-class FloaterFilter:
-    """
-    A class to filter floater points from a dense point cloud using multi-view
-    consistency, accelerated on the GPU with PyTorch.
-    """
-
-    def __init__(self, config: FilteringConfig, device: torch.device):
-        """
-        Initializes the FloaterFilter.
-
-        :param config: A dataclass object containing filtering parameters
-                       (e.g., vote_threshold, depth_threshold).
-        :param device: The torch.device (e.g., 'cuda' or 'cpu') to run on.
-        """
-        self.config = config
-        self.device = device
-
-    def _project_points_torch(
-        self,
-        points3d_world: torch.Tensor,
-        cam_from_world: torch.Tensor,
-        K: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Projects 3D world points to 2D image coordinates using PyTorch.
-
-        :param points3d_world: Tensor of 3D points in world coordinates (N, 3).
-        :param cam_from_world: Camera-from-world transformation matrix (4, 4).
-        :param K: Camera intrinsics matrix (3, 3).
-        :return: A tuple of (points2d, depths) in image coordinates.
-        """
-        points3d_h = torch.cat(
-            [points3d_world, torch.ones_like(points3d_world[:, :1])], dim=1
-        )
-        points_cam_h = (cam_from_world @ points3d_h.T).T
-
-        points_cam = points_cam_h[:, :3]
-        depths = points_cam[:, 2]
-
-        # Camera to image plane projection
-        points_cam_normalized = points_cam / (depths.unsqueeze(1) + 1e-8)
-
-        points2d_h = (K @ points_cam_normalized.T).T
-        points2d = points2d_h[:, :2]
-
-        return points2d, depths
-
-    @torch.no_grad()
-    def filter(
-        self,
-        point_cloud: np.ndarray,
-        colors: np.ndarray,
-        normals: np.ndarray,
-        cached_refinement_data: dict,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Filters the point cloud for floaters.
-
-        :param point_cloud: The dense point cloud (N, 3).
-        :param colors: The colors for each point (N, 3).
-        :param normals: The normals for each point (N, 3).
-        :param cached_refinement_data: Dictionary of refinement data per image.
-        :return: A tuple of (filtered_points, filtered_colors, filtered_normals).
-        """
-
-        if not torch.cuda.is_available() or self.device.type == "cpu":
-            logger.warning(
-                "Filtering on CPU. This may be slow. For GPU acceleration, ensure CUDA is available."
-            )
-
-        points_t = torch.from_numpy(point_cloud).float().to(self.device)
-        normals_t = torch.from_numpy(normals).float().to(self.device)
-        floater_votes_t = torch.zeros(
-            len(points_t), dtype=torch.int32, device=self.device
-        )
-
-        for data in tqdm(cached_refinement_data.values(), desc="Filtering Points (GPU)"):
-            refined_depth = (
-                torch.from_numpy(data["refined_depth"]).float().to(self.device)
-            )
-            h, w = refined_depth.shape
-
-            cam_from_world_t = (
-                torch.from_numpy(data["image"].cam_from_world().matrix())
-                .float()
-                .to(self.device)
-            )
-            K_t = (
-                torch.from_numpy(data["camera"].calibration_matrix())
-                .float()
-                .to(self.device)
-            )
-
-            points2d_t, depths_t = self._project_points_torch(
-                points_t, cam_from_world_t, K_t
-            )
-
-            cam_center = (
-                torch.from_numpy(data["image"].projection_center())
-                .float()
-                .to(self.device)
-            )
-            viewing_dirs = torch.nn.functional.normalize(
-                points_t - cam_center, p=2, dim=1
-            )
-            dot_products = torch.sum(normals_t * -viewing_dirs, dim=1)
-            not_grazing_mask = (
-                dot_products > self.config.grazing_angle_threshold
-            )
-
-            u, v = points2d_t[:, 0], points2d_t[:, 1]
-
-            mask_in_bounds = (
-                (u >= 0)
-                & (u < w)
-                & (v >= 0)
-                & (v < h)
-                & (depths_t > 0)
-                & not_grazing_mask
-            )
-
-            if not torch.any(mask_in_bounds):
-                continue
-
-            u_norm = (u[mask_in_bounds] / (w - 1)) * 2 - 1
-            v_norm = (v[mask_in_bounds] / (h - 1)) * 2 - 1
-            grid = torch.stack([u_norm, v_norm], dim=1).unsqueeze(0).unsqueeze(0)
-
-            refined_depths_at_projections = torch.nn.functional.grid_sample(
-                refined_depth.unsqueeze(0).unsqueeze(0),
-                grid,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
-            ).squeeze()
-
-            projected_depths_valid = depths_t[mask_in_bounds]
-            valid_lookup_mask = refined_depths_at_projections > 0
-
-            inconsistent_mask = (
-                projected_depths_valid[valid_lookup_mask]
-                < self.config.depth_threshold
-                * refined_depths_at_projections[valid_lookup_mask]
-            )
-
-            original_indices = torch.where(mask_in_bounds)[0]
-            indices_with_valid_lookup = original_indices[valid_lookup_mask]
-            inconsistent_indices = indices_with_valid_lookup[inconsistent_mask]
-
-            floater_votes_t.scatter_add_(
-                0,
-                inconsistent_indices,
-                torch.ones_like(inconsistent_indices, dtype=torch.int32),
-            )
-
-        points_to_keep_mask = floater_votes_t < self.config.vote_threshold
-        num_removed = torch.sum(~points_to_keep_mask).item()
-        num_total = len(points_t)
-        if num_total > 0:
-            logger.info(
-                f"-> Filtering removed {num_removed} points ({num_removed / num_total * 100:.2f}%)"
-            )
-
-        keep_mask_np = points_to_keep_mask.cpu().numpy()
-        return (
-            point_cloud[keep_mask_np],
-            colors[keep_mask_np],
-            normals[keep_mask_np],
-        )
+    filtering: FloaterFilterConfig = field(default_factory=FloaterFilterConfig)
+    post_processing: PostProcessingConfig = field(default_factory=PostProcessingConfig)
 
 
 def unproject_points(points2D, depth, camera: pycolmap.Camera):
@@ -299,12 +124,27 @@ def main(config: ScriptConfig):
         f"-> Depth Refiner initialized in {time.time() - step_start_time:.2f}s."
     )
 
-    # --- 3.5. Initialize the Floater Filter ---
+    # --- 3.5. Pre-compute camera matrices for filtering ---
     step_start_time = time.time()
-    logger.info("Initializing Floater Filter...")
-    floater_filter = FloaterFilter(config.filtering, device)
+    logger.info("Pre-computing camera matrices...")
+    camera_matrices_cache = {}
+    
+    for image in rec.images.values():
+        if image.has_pose:
+            camera = rec.cameras[image.camera_id]
+            cam_center = image.projection_center()
+            cam_from_world = image.cam_from_world().matrix()
+            
+            camera_matrices_cache[image.image_id] = {
+                "original_camera": camera,
+                "cam_center": cam_center,
+                "cam_from_world": cam_from_world,
+                "image": image,
+            }
+    
     logger.info(
-        f"-> Floater Filter initialized in {time.time() - step_start_time:.2f}s."
+        f"-> Camera matrices cached for {len(camera_matrices_cache)} images "
+        f"in {time.time() - step_start_time:.2f}s."
     )
 
     # --- 4. Process each image: Infer, Refine, and Densify ---
@@ -312,28 +152,11 @@ def main(config: ScriptConfig):
     all_dense_points = []
     all_dense_colors = []
     all_dense_normals = []
-    all_unrefined_points = []
     cached_refinement_data = {}
     num_points = 0
     image_list = [img for img in rec.images.values() if img.has_pose]
 
-    # --- Filter images based on camera ID (003 and 008) ---
-    original_image_count = len(image_list)
-    filtered_images = []
-    for img in image_list:
-        name_stem = Path(img.name).stem
-        parts = name_stem.split("-")
-        if len(parts) == 2 and parts[1] in ["003", "008"]:
-            filtered_images.append(img)
-
-    image_list = filtered_images
-    logger.info(
-        f"Filtered images: Kept {len(image_list)} out of {original_image_count} "
-        "based on camera ID (003 or 008)."
-    )
-    if not image_list:
-        logger.warning("No images left after filtering. Exiting.")
-        return
+    logger.info(f"Processing {len(image_list)} images with poses.")
 
     for image in tqdm(image_list, desc="Refining and Densifying"):
         per_image_start_time = time.time()
@@ -439,17 +262,6 @@ def main(config: ScriptConfig):
         # The normal map has a shape of (H, W, 3).
         normals = moge_normal[pixels_y_valid, pixels_x_valid]
 
-        # --- [DEBUG] Unproject unrefined depth for comparison ---
-        depth_values_unrefined = moge_depth[pixels_y_valid, pixels_x_valid]
-        points2D_unrefined = np.stack([pixels_x_valid, pixels_y_valid], axis=-1)
-        points3D_camera_unrefined = unproject_points(
-            points2D_unrefined, depth_values_unrefined, camera
-        )
-        points3D_world_unrefined = (
-            image.cam_from_world().inverse() * points3D_camera_unrefined
-        )
-        all_unrefined_points.append(points3D_world_unrefined)
-
         depth_values = refined_depth[pixels_y_valid, pixels_x_valid]
 
         points2D = np.stack([pixels_x_valid, pixels_y_valid], axis=-1)
@@ -503,34 +315,46 @@ def main(config: ScriptConfig):
             f"-> Point cloud concatenated in {time.time() - step_start_time:.2f}s."
         )
 
-        # --- Filter point cloud based on multi-view consistency (GPU) ---
-        logger.info("--- Filtering point cloud for geometric consistency (GPU) ---")
+        # --- Filter point cloud based on multi-view consistency ---
+        logger.info("--- Filtering point cloud for geometric consistency ---")
         filter_start_time = time.time()
-
-        final_point_cloud, final_colors, final_normals = floater_filter.filter(
-            point_cloud=final_point_cloud,
-            colors=final_colors,
-            normals=final_normals,
-            cached_refinement_data=cached_refinement_data,
+        
+        # Initialize floater filter
+        floater_filter = FloaterFilter(config.filtering)
+        
+        # Prepare camera data
+        camera_data = floater_filter.prepare_camera_data(
+            cached_refinement_data, camera_matrices_cache
         )
-
+        
+        # Filter points
+        points_to_keep_mask, num_removed = floater_filter.filter_points(
+            final_point_cloud, final_normals, camera_data, show_progress=True
+        )
+        
+        # Apply the filtering mask
+        final_point_cloud = final_point_cloud[points_to_keep_mask]
+        final_colors = final_colors[points_to_keep_mask]
+        final_normals = final_normals[points_to_keep_mask]
+        
+        logger.info(
+            f"-> Filtering removed {num_removed} points ({num_removed / len(points_to_keep_mask) * 100:.2f}%)"
+        )
         logger.info(f"-> Filtering finished in {time.time() - filter_start_time:.2f}s.")
 
         # --- Downsample point cloud if it's too large ---
         if (
-            config.filtering.enable_downsampling
-            and len(final_point_cloud) > config.filtering.max_points
+            config.post_processing.enable_downsampling
+            and len(final_point_cloud) > config.post_processing.max_points
         ):
             logger.info(
                 f"Point cloud has {len(final_point_cloud)} points. "
-                f"Randomly downsampling to {config.filtering.max_points}..."
+                f"Randomly downsampling to {config.post_processing.max_points}..."
             )
             downsample_start_time = time.time()
 
-            # Perform a simple and fast random sample using NumPy
-            num_points = config.filtering.max_points
             indices = np.random.choice(
-                len(final_point_cloud), num_points, replace=False
+                len(final_point_cloud), config.post_processing.max_points, replace=False
             )
 
             final_point_cloud = final_point_cloud[indices]
@@ -538,7 +362,7 @@ def main(config: ScriptConfig):
             final_normals = final_normals[indices]
 
             logger.info(
-                f"Randomly downsampled to {len(final_point_cloud)} points in "
+                f"Downsampled to {len(final_point_cloud)} points in "
                 f"{time.time() - downsample_start_time:.2f}s."
             )
 
