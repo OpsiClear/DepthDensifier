@@ -5,25 +5,25 @@ Batch script to run depth densification on all datasets in the data directory.
 
 import sys
 from pathlib import Path
-from typing import List
 import logging
 from dataclasses import dataclass, field
 import tyro
-from run_pipeline_optimized_v2 import (
-    main as run_pipeline_main, 
-    ScriptConfig, 
-    PathsConfig, 
+from run_pipeline import (
+    main as run_pipeline_main,
+    ScriptConfig,
+    PathsConfig,
     MoGeConfig,
-    ProcessingConfig
+    ProcessingConfig,
 )
 from depthdensifier.depth_refiner import RefinerConfig
 from depthdensifier.floater_filter import FloaterFilterConfig
+from depthdensifier.utils import find_colmap_datasets
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
 
@@ -31,57 +31,27 @@ logger = logging.getLogger(__name__)
 @dataclass
 class BatchConfig:
     """Configuration for batch processing."""
-    
+
     data_dir: Path = Path("data")
     """Directory containing datasets to process."""
-    results_dir: Path = Path("results")  
+    results_dir: Path = Path("results")
     """Directory to save results."""
-    
+
     # Processing configuration
     processing: ProcessingConfig = field(default_factory=ProcessingConfig)
     """Processing parameters like downsampling."""
-    
-    # Filtering configuration  
+
+    # Filtering configuration
     filtering: FloaterFilterConfig = field(default_factory=FloaterFilterConfig)
     """Multi-view consistency filtering parameters."""
-    
+
     # Refiner configuration
     refiner: RefinerConfig = field(default_factory=RefinerConfig)
     """Depth refinement parameters."""
-    
+
     # MoGe model configuration
     moge: MoGeConfig = field(default_factory=MoGeConfig)
     """MoGe model configuration."""
-
-
-def find_datasets(data_dir: Path) -> List[str]:
-    """Find all valid datasets in the data directory."""
-    datasets = []
-
-    # Skip these files/directories
-    skip_items = {'flowers.txt', 'treehill.txt'}
-
-    for item in data_dir.iterdir():
-        if item.is_dir() and item.name not in skip_items:
-            # Check if it has the required structure
-            sparse_dir = item / "sparse" / "0"
-            images_dir = item / "images"
-
-            if sparse_dir.exists() and images_dir.exists():
-                # Check for COLMAP files
-                cameras_bin = sparse_dir / "cameras.bin"
-                images_bin = sparse_dir / "images.bin"
-                points3d_bin = sparse_dir / "points3D.bin"
-
-                if cameras_bin.exists() and images_bin.exists() and points3d_bin.exists():
-                    datasets.append(item.name)
-                    logger.info(f"Found valid dataset: {item.name}")
-                else:
-                    logger.warning(f"Dataset {item.name} missing COLMAP files, skipping")
-            else:
-                logger.warning(f"Dataset {item.name} missing sparse/0 or images directory, skipping")
-
-    return sorted(datasets)
 
 
 def run_densification_for_dataset(dataset_name: str, batch_config: BatchConfig) -> bool:
@@ -100,22 +70,24 @@ def run_densification_for_dataset(dataset_name: str, batch_config: BatchConfig) 
         # Create configuration for the pipeline using batch config settings
         config = ScriptConfig(
             paths=PathsConfig(
-                recon_path=recon_path,
-                image_dir=image_dir,
-                output_model_dir=output_dir
+                recon_path=recon_path, image_dir=image_dir, output_model_dir=output_dir
             ),
             processing=batch_config.processing,
             filtering=batch_config.filtering,
             refiner=batch_config.refiner,
-            moge=batch_config.moge
+            moge=batch_config.moge,
         )
 
         logger.info(f"Running pipeline for {dataset_name}")
         logger.info(f"  Reconstruction: {recon_path}")
         logger.info(f"  Images: {image_dir}")
         logger.info(f"  Output: {output_dir}")
-        logger.info(f"  Processing config: downsample_factor={config.processing.pipeline_downsample_factor}, density={config.processing.downsample_density}, batch_size={config.processing.batch_size}")
-        logger.info(f"  Filtering config: vote_threshold={config.filtering.vote_threshold}, depth_threshold={config.filtering.depth_threshold}, grazing_angle={config.filtering.grazing_angle_threshold}")
+        logger.info(
+            f"  Processing config: downsample_factor={config.processing.pipeline_downsample_factor}, density={config.processing.downsample_density}, batch_size={config.processing.batch_size}"
+        )
+        logger.info(
+            f"  Filtering config: vote_threshold={config.filtering.vote_threshold}, depth_threshold={config.filtering.depth_threshold}, grazing_angle={config.filtering.grazing_angle_threshold}"
+        )
 
         # Run the pipeline directly
         run_pipeline_main(config)
@@ -138,12 +110,16 @@ def main(config: BatchConfig):
     logger.info(f"Data directory: {config.data_dir.absolute()}")
     logger.info(f"Results directory: {config.results_dir.absolute()}")
     logger.info("Configuration:")
-    logger.info(f"  Processing: downsample_factor={config.processing.pipeline_downsample_factor}, density={config.processing.downsample_density}, batch_size={config.processing.batch_size}")
-    logger.info(f"  Filtering: vote_threshold={config.filtering.vote_threshold}, depth_threshold={config.filtering.depth_threshold}, grazing_angle={config.filtering.grazing_angle_threshold}")
+    logger.info(
+        f"  Processing: downsample_factor={config.processing.pipeline_downsample_factor}, density={config.processing.downsample_density}, batch_size={config.processing.batch_size}"
+    )
+    logger.info(
+        f"  Filtering: vote_threshold={config.filtering.vote_threshold}, depth_threshold={config.filtering.depth_threshold}, grazing_angle={config.filtering.grazing_angle_threshold}"
+    )
     logger.info(f"  MoGe model: {config.moge.checkpoint}")
 
-    # Find all datasets
-    datasets = find_datasets(config.data_dir)
+    # Find all datasets using utility function
+    datasets = find_colmap_datasets(config.data_dir)
 
     if not datasets:
         logger.error("No valid datasets found")
@@ -163,10 +139,12 @@ def main(config: BatchConfig):
         else:
             failed += 1
 
-        logger.info(f"Progress: {successful + failed}/{len(datasets)} datasets processed")
+        logger.info(
+            f"Progress: {successful + failed}/{len(datasets)} datasets processed"
+        )
 
     # Summary
-    logger.info("="*50)
+    logger.info("=" * 50)
     logger.info("BATCH PROCESSING COMPLETE")
     logger.info(f"Successful: {successful}")
     logger.info(f"Failed: {failed}")

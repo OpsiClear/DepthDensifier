@@ -11,9 +11,10 @@ import tyro
 import dataclasses
 import logging
 
-# Import the refiner and floater filter from your source directory
+# Import modules from depthdensifier
 from depthdensifier.depth_refiner import DepthRefiner, RefinerConfig
 from depthdensifier.floater_filter import FloaterFilter, FloaterFilterConfig
+from depthdensifier.utils import unproject_points
 
 # Set up logging
 logging.basicConfig(
@@ -74,18 +75,6 @@ class ScriptConfig:
     refiner: RefinerConfig = field(default_factory=RefinerConfig)
     filtering: FloaterFilterConfig = field(default_factory=FloaterFilterConfig)
     post_processing: PostProcessingConfig = field(default_factory=PostProcessingConfig)
-
-
-def unproject_points(points2D, depth, camera: pycolmap.Camera):
-    """Unprojects 2D image points to 3D camera coordinates."""
-    fx, fy, cx, cy = camera.params
-    u, v = points2D[:, 0], points2D[:, 1]
-    x_normalized = (u - cx) / fx
-    y_normalized = (v - cy) / fy
-    points3D_camera = np.stack(
-        [x_normalized * depth, y_normalized * depth, depth], axis=-1
-    )
-    return points3D_camera
 
 
 # ==============================================================================
